@@ -1,5 +1,5 @@
 // SelfTest.cs - offline logic tests (run with: MiVoiceMic.exe --selftest)
-// 中文：离线单元测试 —— 解码/配置/手势引擎/钩子判定/充电状态解析/按键归因（45 项）
+// 中文：离线单元测试 —— 解码/配置/键名/手势引擎/引擎复位/钩子判定/F20 归一/充电状态解析/按键归因/按键点亮（91 项）
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -19,14 +19,17 @@ static class SelfTest {
         TestNibbleOrder();
         TestFrameAccumulation();
         TestSyncResetsDecoder();
-        TestVkNames();
+        TestKeyNames();
         TestConfigRoundtrip();
         TestWavWriter();
         TestF5Blocker();
         TestKeyMap();
+        TestEngineReset();
         TestChargeState();
         TestLooksFromRemote();
         TestDeferredAttribution();
+        TestVoiceKeyF20();
+        TestKeyLitState();
         Console.WriteLine("== " + passed + " passed, " + failed + " failed ==");
         return failed == 0 ? 0 : 1;
     }
@@ -112,15 +115,21 @@ static class SelfTest {
             (r != null && r.Count == 1 ? r[0][0] + "," + r[0][1] : "no output") + ")");
     }
 
-    static void TestVkNames() {
+    static void TestKeyNames() {
+        // the SINGLE key-name table: hotkey injection and keymap parsing must
+        // agree (an older private injector table silently dropped F10+/OEM keys)
         ushort vk;
-        Check(VkNames.TryParse("RALT", out vk) && vk == 0xA5, "vk RALT=0xA5");
-        Check(VkNames.TryParse("H", out vk) && vk == 0x48, "vk H=0x48");
-        Check(!VkNames.TryParse("NOPE", out vk), "vk unknown rejected");
-        var list = VkNames.ParseList(new List<string> { "LWIN", "H" });
-        Check(list.Length == 2 && list[0] == 0x5B && list[1] == 0x48, "vk parse list LWIN+H");
-        var empty = VkNames.ParseList(new List<string>());
-        Check(empty.Length == 2 && empty[0] == 0xA2, "vk empty list falls back to Ctrl+Win");
+        Check(KeyMapNames.TryParse("RALT", out vk) && vk == 0xA5, "keyname RALT=0xA5");
+        Check(KeyMapNames.TryParse("H", out vk) && vk == 0x48, "keyname H=0x48");
+        Check(!KeyMapNames.TryParse("NOPE", out vk), "keyname unknown rejected");
+        Check(KeyMapNames.TryParse("OEM_PLUS", out vk) && vk == 0xBB, "keyname OEM_PLUS=0xBB");
+        Check(KeyMapNames.TryParse("F12", out vk) && vk == 0x7B, "keyname F12=0x7B");
+        var list = KeyMapNames.ParseList(new List<string> { "LWIN", "H" });
+        Check(list.Length == 2 && list[0] == 0x5B && list[1] == 0x48, "keyname parse list LWIN+H");
+        var empty = KeyMapNames.ParseList(new List<string>());
+        Check(empty.Length == 2 && empty[0] == 0xA2, "keyname empty list falls back to Ctrl+Win");
+        var f12 = KeyMapNames.ParseList(new List<string> { "F12" });
+        Check(f12.Length == 1 && f12[0] == 0x7B, "keyname ParseList preserves F12（注入不再丢键）");
     }
 
     static void TestConfigRoundtrip() {
@@ -245,6 +254,59 @@ static class SelfTest {
             "gesture: early release taps click combo");
     }
 
+    static void TestEngineReset() {
+        // link drop / table swap: the engine must release every combo it holds
+        // (their UP is never coming) but never fire half-pressed actions
+        var mk = new KeyMapConfig();
+        mk.Find("up").click.kind = "combo";
+        mk.Find("up").click.keys = "LCTRL+Z";
+        mk.Find("up").click.tap = false;                          // hold-through click
+        mk.Find("ok").hold = new KeyMapAction { kind = "combo", keys = "LALT+TAB", tap = false, ms = 400 };
+        var bound = new List<KeyMapEntry>();
+        foreach (KeyMapEntry e in mk.keys) if (e.Mapped) bound.Add(e);
+        var eng = new GestureEngine(bound);
+        var outc = new List<GestureEngine.OutAction>();
+
+        eng.Feed(0x26, true, 1000, outc);                         // hold-through click pressed (Down went out)
+        Check(outc.Count == 1 && outc[0].Phase == GestureEngine.Phase.Down, "reset: 按住时 click 组合键已按下");
+        outc.Clear();
+        eng.Reset(outc);
+        Check(outc.Count == 1 && outc[0].Phase == GestureEngine.Phase.Up && outc[0].Action.keys == "LCTRL+Z",
+            "reset: 断链释放已按下的 click 组合键");
+        outc.Clear();
+        eng.Feed(0x26, false, 1100, outc);                        // late UP after reset: inert
+        Check(outc.Count == 0, "reset: 复位后的 UP 不再补发动作");
+        outc.Clear();
+
+        eng.Feed(0x0D, true, 2000, outc);
+        eng.Tick(2500, outc);                                     // hold threshold crossed
+        Check(outc.Count == 1 && outc[0].Phase == GestureEngine.Phase.Down, "reset: hold 已触发按下");
+        outc.Clear();
+        eng.Reset(outc);
+        Check(outc.Count == 1 && outc[0].Phase == GestureEngine.Phase.Up && outc[0].Action.keys == "LALT+TAB",
+            "reset: 断链释放已触发的 hold-through");
+        outc.Clear();
+
+        eng.Feed(0x0D, true, 5000, outc);                         // armed, below threshold
+        Check(outc.Count == 0, "reset: hold 未到阈值无动作");
+        eng.Reset(outc);
+        Check(outc.Count == 0, "reset: 未触发的 armed 按下不补发动作（断链不触发）");
+    }
+
+    static void TestVoiceKeyF20() {
+        // with the bundled filter driver the voice key arrives as F20; the hook
+        // and the raw sink must treat it exactly like F5 (blockF5 + mapping)
+        Check(InputRouter.NormalizeVoiceKey(0x83) == 0x74, "F20 归一化为 F5（驱动语音键）");
+        Check(InputRouter.NormalizeVoiceKey(0x74) == 0x74, "F5 保持不变");
+        InputRouter.SetMappingEnabled(false);
+        InputRouter.SetBlockF5(true);
+        InputRouter.SetLinked(true);
+        long before = InputRouter.SwallowedCount;
+        IntPtr r = InputRouter.TestDispatch(0x83, true, true);
+        InputRouter.SetLinked(true);
+        Check(r == (IntPtr)1 && InputRouter.SwallowedCount == before + 1, "hook: 驱动下语音键 F20 同样被拦截");
+    }
+
     static void TestChargeState() {
         // 00 61 00: RC003 real-device sample (reference/remote-mic-app bug doc 2026-08-08)
         Check(BleVoiceLink.ParseChargeState(new byte[] { 0x00, 0x61, 0x00 }) == BleVoiceLink.CHG_DISCHARGING,
@@ -309,6 +371,8 @@ static class SelfTest {
         Check(RawSink.FindRecent(0x25, true, now - 300, now + 1000) == -1, "ring: down/up 类型不符未命中");
         RawSink.SeedRing(0x25, false, false, 50);
         Check(RawSink.FindRecent(0x25, false, now - 300, now + 1000) == 0, "ring: 更新的物理键盘 up 优先");
+        RawSink.SeedRing(0x27, true, true, 80);
+        Check(RawSink.FindRecent(0x27, true, now - 300, now + 1000) == 1, "ring: 命中遥控器 down（重复键探测用）");
 
         // hook deferred path: ambiguous mapped DOWN is swallowed (no ghost) and
         // its UP passes so the sink can attribute it; confident remote presses
@@ -325,6 +389,20 @@ static class SelfTest {
         IntPtr defUp = InputRouter.TestDispatch(0x25, false);
         Check(defDown == (IntPtr)1, "延迟归因：无证据 DOWN 吞下（不透传防 ghost）");
         Check(defUp != (IntPtr)1, "延迟归因：UP 放行（孤儿抬起，供 WM_INPUT 归因）");
+        // hold-to-repeat: the first auto-repeat is passed as the device probe;
+        // a physical verdict keeps the repeat stream real, a remote one stops it
+        RawSink.SeedEvidence(-1, -1);
+        Check(InputRouter.TestDispatch(0x25, true) == (IntPtr)1, "重复键：按下吞下");
+        Check(InputRouter.TestDispatch(0x25, true) != (IntPtr)1, "重复键：首条自动重复放行（探测）");
+        InputRouter.TestSetProbeVerdict(0x25, 0);
+        Check(InputRouter.TestDispatch(0x25, true) != (IntPtr)1, "重复键：物理键盘判定 → 后续重复键放行");
+        Check(InputRouter.TestDispatch(0x25, false) != (IntPtr)1, "重复键：物理键盘 UP 放行");
+        RawSink.SeedEvidence(-1, -1);
+        Check(InputRouter.TestDispatch(0x25, true) == (IntPtr)1, "重复键(遥控器)：按下吞下");
+        Check(InputRouter.TestDispatch(0x25, true) != (IntPtr)1, "重复键(遥控器)：首条自动重复放行（探测）");
+        InputRouter.TestSetProbeVerdict(0x25, 1);
+        Check(InputRouter.TestDispatch(0x25, true) == (IntPtr)1, "重复键(遥控器)：遥控器判定 → 后续重复键吞下");
+        Check(InputRouter.TestDispatch(0x25, false) != (IntPtr)1, "重复键(遥控器)：UP 仍放行（避免应用卡键）");
         RawSink.SeedEvidence(100, -1);
         IntPtr remDown = InputRouter.TestDispatch(0x25, true);
         IntPtr remUp = InputRouter.TestDispatch(0x25, false);
@@ -332,5 +410,43 @@ static class SelfTest {
         InputRouter.SetKeyMap(null);
         RawSink.SeedEvidence(-1, -1);
         InputRouter.SetBlockF5(true);
+    }
+
+    static void TestKeyLitState() {
+        // the lit state is fed only from device-attributed remote events; the
+        // vk->keyId table comes from the keymap (all keys, mapped or not)
+        UiState.TestAgeLit(100000); UiState.Take();              // clear residue lit by the hook tests above
+        var map = new KeyMapConfig();
+        map.enabled = false;                                     // lighting must not depend on mapping being on
+        InputRouter.SetKeyMap(map, null);
+        long v0 = UiState.Take().Version;
+        InputRouter.NoteRemoteKey(0x27, true);                   // VK_RIGHT down = 遥控器方向右
+        var s = UiState.Take();
+        Check(s.IsLit("right"), "按键点亮：遥控器方向右按下点亮");
+        Check(s.Version > v0, "按键点亮：版本号推进（触发重绘）");
+        long v1 = s.Version;
+        InputRouter.NoteRemoteKey(0x99, true);                   // unbound vk: no key, no repaint
+        s = UiState.Take();
+        Check(!s.IsLit("ok") && s.Version == v1, "按键点亮：未知 vk 不点亮、不触发重绘");
+        Check(UiState.HasLitKey(), "按键点亮：HasLitKey 报告点亮中");
+        long v2 = s.Version;
+        InputRouter.NoteRemoteKey(0x27, false);                  // up: off immediately, no 1.2s linger
+        s = UiState.Take();
+        Check(!s.IsLit("right"), "按键点亮：松开立即熄灭");
+        Check(!UiState.HasLitKey(), "按键点亮：松开后 HasLitKey 为 false");
+        Check(s.Version > v2, "按键点亮：松开触发重绘");
+        long v3 = s.Version;
+        InputRouter.NoteRemoteKey(0x27, false);                  // duplicate up: no repaint churn
+        Check(UiState.Take().Version == v3, "按键点亮：重复松开不触发重绘");
+        // lost-release fallback: a down whose up never arrives expires on its own
+        InputRouter.NoteRemoteKey(0x27, true);
+        Check(UiState.Take().IsLit("right"), "按键点亮：再次按下点亮");
+        UiState.TestAgeLit(1300);                                // past the 1200ms holdover
+        s = UiState.Take();
+        Check(!s.IsLit("right"), "按键点亮：丢失松开时超时自动熄灭");
+        Check(!UiState.HasLitKey(), "按键点亮：超时后 HasLitKey 为 false");
+        InputRouter.SetKeyMap(null);                             // no table -> nothing lights
+        InputRouter.NoteRemoteKey(0x27, true);
+        Check(!UiState.Take().IsLit("right"), "按键点亮：空映射表不点亮");
     }
 }

@@ -64,6 +64,7 @@ class ConnectPage : MacPage {
     MacButton reconnectBtn, testHotkeyBtn, testToneBtn;
     ComboCaptureBox comboBox;
     MacTextBox leadBox;
+    Timer leadDebounce;                                   // saves once typing pauses, not per keystroke
     string gainText = "+0 dB";
     readonly Font titleFont, cardHeadFont, bodyFont, smallFont;
 
@@ -92,7 +93,9 @@ class ConnectPage : MacPage {
         modeSeg.Changed += delegate { OnModeEdited(); };
 
         leadBox = new MacTextBox(App.Config.switchLeadMs.ToString()) { Width = MacTheme.S(74) };
-        leadBox.Box.TextChanged += delegate { OnLeadChanged(); };
+        leadDebounce = new Timer { Interval = 400 };
+        leadDebounce.Tick += delegate { leadDebounce.Stop(); OnLeadChanged(); };
+        leadBox.Box.TextChanged += delegate { leadDebounce.Stop(); leadDebounce.Start(); };
 
         testHotkeyBtn = new MacButton("测试热键", false, true) { Width = MacTheme.S(120) };
         testHotkeyBtn.Clicked += delegate { TestHotkey(); };
@@ -229,7 +232,7 @@ class ConnectPage : MacPage {
 
     void TestHotkey() {
         try {
-            ushort[] vks = VkNames.ParseList(App.Config.hotkey.keys);
+            ushort[] vks = KeyMapNames.ParseList(App.Config.hotkey.keys);
             if (vks.Length == 0) return;
             KeySender.Tap(vks);
             Log.Info("[UI] 测试热键: " + KeyMapNames.FriendlyCombo(vks));
@@ -300,7 +303,7 @@ class ConnectPage : MacPage {
         var s = UiState.Take();
         int w = deviceCard.Width, hgt = deviceCard.Height;
         var art = new RectangleF(MacTheme.S(16), MacTheme.S(20), w - MacTheme.S(32), hgt - MacTheme.S(244));
-        RemotePainter.Draw(g, art, s.Talking, null);
+        RemotePainter.Draw(g, art, s.Talking, null, s.KeysLit);
 
         float infoY = art.Bottom + MacTheme.S(4);
         string devName = string.IsNullOrEmpty(s.Device) ? "小米蓝牙遥控器 2 Pro" : s.Device;

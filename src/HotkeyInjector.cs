@@ -4,49 +4,18 @@
 // Two proven subtleties (from RemoteMapper NOTES.md):
 //  1. Right Alt is an EXTENDED key - must set KEYEVENTF_EXTENDEDKEY or the IME
 //     sees Left Alt and triggers its own behaviour.
-//  2. While the remote's voice key is held, the remote spams HID F5. Our
-//     low-level keyboard hook marshals ALL system input through the hook thread,
-//     and that traffic disturbs injection timing. So we suspend the hook while
-//     injecting and re-install it afterwards from the pump thread.
+//  2. (Historical) Injections used to unhook the LL hook and reinstall it via a
+//     posted message afterwards. Real-device logs (2026-09-07) showed both
+//     failure modes this creates: the rehook message eaten during a concurrent
+//     injection window left input unhooked until the next voice session, and an
+//     immediate same-burst reinstall could leave the hook registered but
+//     receiving NO events (mapped keys passed as raw arrows for seconds). The
+//     hook is now simply NEVER removed: HookCb ignores injected keys via
+//     LLKHF_INJECTED, so our own SendInput can never loop through it.
 // 中文：SendInput 组合键注入 —— 输入法语音热键的按住/点按控制
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-
-static class VkNames {
-    static readonly Dictionary<string, ushort> map = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase) {
-        { "LCTRL", 0xA2 }, { "RCTRL", 0xA3 }, { "LALT", 0xA4 }, { "RALT", 0xA5 },
-        { "LSHIFT", 0xA0 }, { "RSHIFT", 0xA1 }, { "LWIN", 0x5B }, { "RWIN", 0x5C },
-        { "CTRL", 0xA2 }, { "ALT", 0xA4 }, { "SHIFT", 0xA0 }, { "WIN", 0x5B },
-        { "COMMA", 0xBC }, { "PERIOD", 0xBE }, { "SPACE", 0x20 }, { "ENTER", 0x0D },
-        { "TAB", 0x09 }, { "ESC", 0x1B }, { "BACKSPACE", 0x08 }, { "DELETE", 0x2E },
-        { "F1", 0x70 }, { "F2", 0x71 }, { "F3", 0x72 }, { "F4", 0x73 }, { "F5", 0x74 },
-        { "F6", 0x75 }, { "F7", 0x76 }, { "F8", 0x77 }, { "F9", 0x78 },
-        { "UP", 0x26 }, { "DOWN", 0x28 }, { "LEFT", 0x25 }, { "RIGHT", 0x27 },
-    };
-
-    public static bool TryParse(string name, out ushort vk) {
-        if (string.IsNullOrEmpty(name)) { vk = 0; return false; }
-        if (map.TryGetValue(name.Trim(), out vk)) return true;
-        if (name.Length == 1) {
-            char c = name[0];
-            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')) { vk = (ushort)c; return true; }
-        }
-        return false;
-    }
-
-    public static ushort[] ParseList(IList<string> names) {
-        var list = new List<ushort>();
-        if (names != null)
-            foreach (string n in names) {
-                ushort vk;
-                if (TryParse(n, out vk) && !list.Contains(vk)) list.Add(vk);
-                else if (!string.IsNullOrEmpty(n)) Log.Warn("[CFG] unknown key name: " + n);
-            }
-        if (list.Count == 0) { list.Add(0xA2); list.Add(0x5B); }   // Ctrl+Win fallback (WeType default)
-        return list.ToArray();
-    }
-}
 
 sealed class HotkeyInjector {
     [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
@@ -71,14 +40,12 @@ sealed class HotkeyInjector {
     readonly bool tapMode;        // true: tap combo on press and again on release
 
     public HotkeyInjector(IList<string> keyNames, string mode) {
-        combo = VkNames.ParseList(keyNames);
+        combo = KeyMapNames.ParseList(keyNames);
         tapMode = mode != null && mode.Equals("tap", StringComparison.OrdinalIgnoreCase);
     }
 
     public string Describe() {
-        var parts = new List<string>();
-        foreach (ushort vk in combo) parts.Add("0x" + vk.ToString("X2"));
-        return string.Join("+", parts.ToArray()) + (tapMode ? " (tap x2)" : " (hold)");
+        return KeyMapNames.FriendlyCombo(combo) + (tapMode ? "（点按 x2）" : "（按住）");
     }
 
     static bool IsExtended(ushort vk) {
@@ -122,36 +89,28 @@ sealed class HotkeyInjector {
 
     /// Voice key pressed: default-mic already switched by caller.
     public void OnVoiceDown() {
-        InputRouter.Suspend();
-        try {
-            foreach (ushort vk in combo) ForcedRelease(vk);   // clean slate
-            System.Threading.Thread.Sleep(50);
-            if (tapMode) {
-                if (!TapOnce(combo)) Log.Warn("[KEY] tap down failed");
-            } else {
-                if (!PressAll(combo)) Log.Warn("[KEY] press failed");
-            }
-        } finally { InputRouter.Resume(); }
+        foreach (ushort vk in combo) ForcedRelease(vk);   // clean slate
+        System.Threading.Thread.Sleep(50);
+        if (tapMode) {
+            if (!TapOnce(combo)) Log.Warn("[KEY] tap down failed");
+        } else {
+            if (!PressAll(combo)) Log.Warn("[KEY] press failed");
+        }
     }
 
     /// Voice key released.
     public void OnVoiceUp() {
-        InputRouter.Suspend();
-        try {
-            if (tapMode) {
-                if (!TapOnce(combo)) Log.Warn("[KEY] tap up failed");
-            } else {
-                if (!ReleaseAll(combo)) Log.Warn("[KEY] release failed");
-            }
-        } finally { InputRouter.Resume(); }
+        if (tapMode) {
+            if (!TapOnce(combo)) Log.Warn("[KEY] tap up failed");
+        } else {
+            if (!ReleaseAll(combo)) Log.Warn("[KEY] release failed");
+        }
     }
 
     /// Safety net: release held keys (on exit / link loss).
     public void ForceRelease() {
         try {
-            InputRouter.Suspend();
             foreach (ushort vk in combo) ForcedRelease(vk);
-            InputRouter.Resume();
         } catch (Exception ex) { Log.Warn("[KEY] force release: " + ex.Message); }
     }
 }

@@ -53,8 +53,6 @@ static class E2E {
             Console.WriteLine("FAIL: 未找到录音设备 \"" + cfg.cableCaptureName + "\" (VB-CABLE 未安装或音频栈异常)");
             return 1;
         }
-        // (cableIdxFound was located by Run())
-
         // 2. voice source: TTS (zh-CN if available), else 1 kHz beep fallback
         short[] pcm;
         try {

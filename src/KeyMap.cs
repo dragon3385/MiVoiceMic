@@ -237,6 +237,24 @@ static class KeyMapNames {
         return true;
     }
 
+    /// Parse a hotkey name list for injection ("LCTRL","WIN","H"...). Unknown
+    /// names are warned and skipped; an all-empty result falls back to
+    /// Ctrl+Win (WeType default) so a stale config can never silently disable
+    /// the voice hotkey. Single source of truth for BOTH the keymap and the
+    /// hotkey injector - there used to be a second, smaller table here and
+    /// keys like F10+/OEM_*/PGUP were silently dropped at injection time.
+    public static ushort[] ParseList(IList<string> names) {
+        var list = new List<ushort>();
+        if (names != null)
+            foreach (string n in names) {
+                ushort v;
+                if (TryParse(n, out v)) { if (!list.Contains(v)) list.Add(v); }
+                else if (!string.IsNullOrEmpty(n)) Log.Warn("[CFG] unknown key name: " + n);
+            }
+        if (list.Count == 0) { list.Add(0xA2); list.Add(0x5B); }   // Ctrl+Win fallback
+        return list.ToArray();
+    }
+
     public static string FormatCombo(ushort[] combo) {
         if (combo == null || combo.Length == 0) return "";
         var parts = new List<string>();

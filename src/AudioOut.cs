@@ -20,6 +20,8 @@ sealed class AudioOut {
     [DllImport("winmm.dll")]
     static extern int waveOutReset(IntPtr hwo);
     [DllImport("winmm.dll")]
+    static extern int waveOutUnprepareHeader(IntPtr hwo, IntPtr pwh, int cbwh);
+    [DllImport("winmm.dll")]
     static extern int waveOutClose(IntPtr hwo);
     [DllImport("winmm.dll")]
     static extern uint waveOutGetNumDevs();
@@ -107,7 +109,10 @@ sealed class AudioOut {
         if (hWave != IntPtr.Zero) {
             waveOutReset(hWave);
             for (int i = 0; i < NB; i++) {
-                if (hdr[i] != IntPtr.Zero) { Marshal.FreeHGlobal(hdr[i]); Marshal.FreeHGlobal(data[i]); hdr[i] = IntPtr.Zero; }
+                if (hdr[i] != IntPtr.Zero) {
+                    waveOutUnprepareHeader(hWave, hdr[i], HDR_SIZE);   // API contract: unprepare before freeing
+                    Marshal.FreeHGlobal(hdr[i]); Marshal.FreeHGlobal(data[i]); hdr[i] = IntPtr.Zero;
+                }
             }
             waveOutClose(hWave);
             hWave = IntPtr.Zero;

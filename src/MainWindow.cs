@@ -5,6 +5,7 @@
 // 中文：主窗口 —— 标准可缩放窗口 + 侧边栏四页导航；关窗最小化到托盘
 using System;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 abstract class MacPage : UserControl {
@@ -92,10 +93,15 @@ sealed class MainWindow : Form {
         }
         lock (flashGate) {
             if (flashKey != null && Environment.TickCount - flashTick < 1200) {
-                pages[current].OnActionFired(flashKey, flashDesc);
-            } else if (flashKey != null && Environment.TickCount - flashTick >= 1200) {
+                if (s.IsLit(flashKey)) {
+                    pages[current].OnActionFired(flashKey, flashDesc);
+                } else {                                           // key released: its flash ends with the press
+                    flashKey = null;
+                    pages[current].OnActionFired(null, null);
+                }
+            } else if (flashKey != null) {                         // flash window over
                 flashKey = null;
-                pages[current].OnActionFired(null, null);       // flash over
+                pages[current].OnActionFired(null, null);
             }
         }
         Invalidate();                                          // sidebar status line
@@ -188,6 +194,26 @@ sealed class MainWindow : Form {
                 } catch { }
             }
         }
+    }
+
+    // ---- per-monitor DPI ------------------------------------------------------
+    // PMv2 delivers WM_DPICHANGED when the window crosses monitors; GDI+ point
+    // fonts rescale on their own, but MacTheme.Scale-driven layout coordinates
+    // do not - re-derive the scale, take the suggested rect (keeps the window's
+    // physical size) and relayout everything. Widget sizes fixed at construction
+    // (toggles, buttons) keep their old pixel size until recreated - accepted.
+    const int WM_DPICHANGED = 0x02E0;
+    [StructLayout(LayoutKind.Sequential)] struct DpiRect { public int L, T, R, B; }
+
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == WM_DPICHANGED && m.WParam != IntPtr.Zero && m.LParam != IntPtr.Zero) {
+            MacTheme.Init((int)(short)((long)m.WParam & 0xFFFF));     // LOWORD = new DPI
+            var r = (DpiRect)Marshal.PtrToStructure(m.LParam, typeof(DpiRect));
+            SetBounds(r.L, r.T, r.R - r.L, r.B - r.T);                // fires OnSizeChanged -> LayoutPages/LayoutNav
+            foreach (MacPage p in pages) p.Relayout();
+            Invalidate(true);
+        }
+        base.WndProc(ref m);
     }
 
     // ---- paint ----------------------------------------------------------------

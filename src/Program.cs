@@ -38,11 +38,12 @@ static class Program {
 
         try { SetProcessDpiAwarenessContext((IntPtr)(-4)); } catch { try { SetProcessDPIAware(); } catch { } }
 
+        // WinForms housekeeping must precede any window/control creation
+        System.Windows.Forms.Application.EnableVisualStyles();
+        MacTheme.Init();
         var cfg = Config.Load();
         var app = new App(cfg);
         app.Run();
-        System.Windows.Forms.Application.EnableVisualStyles();
-        MacTheme.Init();
         var main = new MainWindow(app);
         TrayIcon.MainWindow = main;
         TrayIcon.Create(app);

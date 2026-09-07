@@ -46,6 +46,15 @@ static class InputRouter {
     const uint WM_APP_REHOOK = 0x8000;
     const uint LLKHF_INJECTED = 0x10;
     const ushort VK_F5 = 0x74;
+    const ushort VK_F20 = 0x83;           // the bundled filter driver's voice-key spelling
+
+    /// The bundled filter driver remaps the remote's voice key F5 -> F20 (so it
+    /// can never collide with the physical F5, see driver/remap.c). Both
+    /// spellings must behave identically in the hook and in raw-input
+    /// attribution, so F20 is normalized to F5 before any decision. A physical
+    /// F20 keyboard is vanishingly rare and gets the same treatment (the same
+    /// tradeoff as the physical F5 today).
+    internal static uint NormalizeVoiceKey(uint vk) { return vk == VK_F20 ? VK_F5 : vk; }
 
     static readonly HookProc proc = HookCb;
     static volatile IntPtr hhk = IntPtr.Zero;
@@ -55,6 +64,25 @@ static class InputRouter {
     static volatile bool linked;          // BLE link connected
     public static long SwallowedCount;
     static int lastPassLogTick;           // hook thread only: throttle passthrough notes
+    static int lastTraceLogTick;          // hook thread only: throttle the live-state trace
+
+    /// Throttled (1/s) trace of every real (non-injected) key event with the
+    /// hook's live decision state - proves the callback runs at all and shows
+    /// WHY a key passed (linked/blockF5/mapping state, installed handle).
+    static void HookTrace(KBDLLHOOKSTRUCT k, bool down) {
+        try {
+            uint vk = NormalizeVoiceKey(k.vkCode);
+            int t = Environment.TickCount;
+            if (t - lastTraceLogTick > 1000 || t < lastTraceLogTick) {
+                lastTraceLogTick = t;
+                bool mapCase = linked && mappingEnabled && engine.HasBinding(vk);
+                Log.Info("[INPUT] hook trace vk=0x" + vk.ToString("X2") + (down ? " down" : " up") +
+                         " linked=" + (linked ? 1 : 0) + " blockF5=" + (blockF5 ? 1 : 0) +
+                         " map=" + (mappingEnabled ? 1 : 0) + " bind=" + (mapCase ? 1 : 0) +
+                         " flags=0x" + k.flags.ToString("X") + " hhk=0x" + hhk.ToString("X"));
+            }
+        } catch { }
+    }
 
     // ---- mapping state ----------------------------------------------------
     static readonly object mapGate = new object();
@@ -72,36 +100,98 @@ static class InputRouter {
         if (h != null) { try { h(id, desc); } catch { } }
     }
 
+    // ---- remote key lit state (UI feedback) ----------------------------------
+    // vk -> keymap entry id, rebuilt with every mapping table swap. Fed from
+    // device-attributed remote events (raw sink WM_INPUT + hook swallow
+    // decisions) so the UI art can light the pressed key. Physical keyboards
+    // and injected keys never reach these feed points. Read-only after build,
+    // swapped by reference - safe to read from hook/sink threads without locks.
+    static volatile Dictionary<ushort, string> vkToId = new Dictionary<ushort, string>();
+
+    /// The given vk was just seen from the REMOTE: light its key on the art
+    /// (down / device repeat) or turn it off (release).
+    public static void NoteRemoteKey(uint vk, bool down) {
+        string id;
+        var t = vkToId;
+        if (t.TryGetValue((ushort)vk, out id)) UiState.NoteRemoteKey(id, down);
+    }
+
     // ---- deferred attribution ----------------------------------------------
     // A mapped key with no fresh device evidence must NOT be passed through
     // (a remote first press would ghost into the app) and cannot be attributed
     // as a swallowed key (swallowed keys generate no WM_INPUT). So: swallow the
-    // DOWN silently, and when the UP arrives pass it through - an orphan keyup
-    // is harmless, and only a passed event gets a WM_INPUT whose hDevice names
-    // the true device. The map worker then either fires the mapped action
-    // (remote) or replays the original key via SendInput (physical). Per-event
-    // truth, no guessing, at the cost of that one press acting on release.
-    sealed class PendingUp { public ushort Vk; public long HookTick; public int Verdict; }
-    static readonly Dictionary<uint, long> pendingDowns = new Dictionary<uint, long>();   // hook thread only
-    static readonly List<PendingUp> pendingUps = new List<PendingUp>();                   // hook writes, worker drains
+    // DOWN silently, and decide from events we CAN pass:
+    //   - the OS auto-repeat (held key, after the repeat delay): the FIRST
+    //     repeat is passed as the probe, REWRITTEN to VK_F24 (0x87) so nothing
+    //     a remote press does can ever ghost a real arrow into the app; its
+    //     WM_INPUT names the device. Physical -> all further repeats flow as
+    //     real keys, so hold-to-repeat works; remote -> stop passing, arm the
+    //     gesture engine with the backdated press (clicks fire once, hold
+    //     gestures fire at their threshold) and swallow further repeats.
+    //   - the UP: an orphan keyup is always harmless to pass, and only a
+    //     passed event reaches the raw-input sink. A click (no repeat seen)
+    //     fires the mapped action (remote) or replays the original key
+    //     (physical) on release.
+    // Per-event truth, no guessing, no leaked keys.
+    sealed class PendingPress { public long DownTick; public bool Probing; }              // hook thread only
+    internal sealed class PendingEvent { public ushort Vk; public ushort RealVk; public long HookTick; public long DownTick; public bool Probe; public bool Probing; }
+    static readonly Dictionary<uint, PendingPress> pending = new Dictionary<uint, PendingPress>();  // hook thread only
+    static readonly Dictionary<uint, int> probeVerdict = new Dictionary<uint, int>();     // worker writes, hook reads
+    static readonly Dictionary<uint, bool> armedPresses = new Dictionary<uint, bool>();   // worker only: engine holds the real press
+    static readonly List<PendingEvent> pendingEvents = new List<PendingEvent>();          // hook writes, worker drains
     static readonly object pendingGate = new object();
+    const ushort PROBE_VK = 0x87;                         // VK_F24: unbound, ignored by apps
+    const uint LLKHF_EXTENDED = 0x01;
 
     static IntPtr HookCb(int nCode, IntPtr wParam, IntPtr lParam) {
         try {
+            if (nCode >= 0) {
+                var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                if ((k.flags & LLKHF_INJECTED) == 0)                       // never touch injected input
+                    HookTrace(k, wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104);
+            }
             if (nCode >= 0 && linked) {
                 var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
                 if ((k.flags & LLKHF_INJECTED) == 0) {          // never touch injected input
                     bool down = wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104;
-                    uint vk = k.vkCode;
+                    uint vk = NormalizeVoiceKey(k.vkCode);      // driver voice key (F20) == F5
                     bool f5Case = vk == VK_F5 && blockF5;        // legacy blocker semantics
                     bool mapCase = false;
                     if (mappingEnabled) lock (mapGate) mapCase = engine.HasBinding(vk);
-                    if (mapCase && !down && pendingDowns.Count > 0) {
-                        bool wasPending = false;
-                        lock (pendingGate) wasPending = pendingDowns.Remove(vk);
-                        if (wasPending) {
-                            lock (pendingGate) pendingUps.Add(new PendingUp { Vk = (ushort)vk, HookTick = NowMs() });
-                            return CallNextHookEx(hhk, nCode, wParam, lParam);   // orphan UP: pass, its WM_INPUT decides
+                    if (mapCase && !f5Case && pending.Count > 0) {
+                        PendingPress pp;
+                        pending.TryGetValue(vk, out pp);
+                        if (pp != null) {
+                            if (down) {
+                                if (!pp.Probing) {
+                                    pp.Probing = true;           // first auto-repeat becomes the device probe,
+                                    KBDLLHOOKSTRUCT probe = k;   // rewritten so it can never ghost a real key
+                                    probe.vkCode = PROBE_VK;
+                                    probe.scanCode = KeySender.ScanOf(PROBE_VK);
+                                    probe.flags &= ~LLKHF_EXTENDED;
+                                    Marshal.StructureToPtr(probe, lParam, false);
+                                    lock (pendingGate) pendingEvents.Add(new PendingEvent {
+                                        Vk = PROBE_VK, RealVk = (ushort)vk, HookTick = NowMs(), DownTick = pp.DownTick, Probe = true
+                                    });
+                                } else {
+                                    int v; bool known;
+                                    lock (pendingGate) known = probeVerdict.TryGetValue(vk, out v);
+                                    if (!known) return (IntPtr)1;             // verdict not in yet: swallow
+                                    if (v == 1) {                             // remote: swallow, keep the art lit while held
+                                        NoteRemoteKey(vk, true);
+                                        return (IntPtr)1;
+                                    }
+                                }
+                                return CallNextHookEx(hhk, nCode, wParam, lParam); // physical: repeats flow as real keys
+                            }
+                            // UP: pass in every case - the app saw the probe
+                            // repeats (or nothing at all) and must see the release
+                            bool probing = pp.Probing;
+                            pending.Remove(vk);
+                            lock (pendingGate) pendingEvents.Add(new PendingEvent {
+                                Vk = (ushort)vk, RealVk = (ushort)vk, HookTick = NowMs(), Probe = false, Probing = probing
+                            });
+                            return CallNextHookEx(hhk, nCode, wParam, lParam);
                         }
                     }
                     if (f5Case || mapCase) {
@@ -111,17 +201,19 @@ static class InputRouter {
                             Interlocked.Increment(ref SwallowedCount);
                             if (mapCase) {
                                 RawSink.NoteRemoteActivity();    // swallowed keys produce no WM_INPUT - latch the burst
+                                NoteRemoteKey(vk, down);         // swallowed = the sink will never see it: light here, dark on up
                                 mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = down, TickMs = NowMs() });
                             }
                             return (IntPtr)1;                    // swallowed
                         }
                         if (mapCase && down) {
-                            // ambiguous DOWN: swallow silently and wait for the UP
-                            lock (pendingGate) pendingDowns[vk] = NowMs();
+                            // ambiguous DOWN: swallow silently; auto-repeats will
+                            // probe the device, the UP settles the rest
+                            pending[vk] = new PendingPress { DownTick = NowMs() };
                             int td = Environment.TickCount;
                             if (td - lastPassLogTick > 2000 || td < lastPassLogTick) {
                                 lastPassLogTick = td;
-                                Log.Info("[INPUT] 0x" + vk.ToString("X2") + " 按下 无近期证据 → 延迟归因（松开时判定） 证据=" + RawSink.LastProbe);
+                                Log.Info("[INPUT] 0x" + vk.ToString("X2") + " 按下 无近期证据 → 延迟归因（重复键探测/松开判定） 证据=" + RawSink.LastProbe);
                             }
                             return (IntPtr)1;
                         }
@@ -146,36 +238,106 @@ static class InputRouter {
         return CallNextHookEx(hhk, nCode, wParam, lParam);
     }
 
-    /// Map-worker side: correlate each passed UP against the raw-input ring and
-    /// act on the per-event verdict. verdict 1 = remote (synthesize the press
-    /// the hook swallowed), 0 = physical (replay the original key), -1 = no
-    /// raw input seen within 500ms (sink blind) -> replay, consistent with the
-    /// global pass-through default.
-    static void ResolvePendingUps() {
-        List<PendingUp> done = null;
+    /// Map-worker side: resolve probes against the raw-input ring (per-event
+    /// truth), then settle releases. A remote probe verdict arms the gesture
+    /// engine with the backdated press so hold gestures fire at their threshold
+    /// (and clicks fire once, ~immediately) - the release then only completes
+    /// the engine state, so a configured click can never leak on top of a hold.
+    /// Physical click releases (no probe seen) replay the original key.
+    static void ResolvePendingEvents() {
+        List<PendingEvent> remoteClicks = null;
+        List<ushort> physicalTaps = null;
+        List<PendingEvent> engineCompletions = null;
+        List<PendingEvent> armings = null;
+        bool releaseProbeVk = false;
         long now = NowMs();
         lock (pendingGate) {
-            for (int i = pendingUps.Count - 1; i >= 0; i--) {
-                PendingUp p = pendingUps[i];
-                int v = RawSink.FindRecent(p.Vk, false, p.HookTick - 30, now);
-                if (v < 0 && now - p.HookTick < 500) continue;   // its WM_INPUT has not landed yet
-                p.Verdict = v < 0 ? 0 : v;
-                pendingUps.RemoveAt(i);
-                if (done == null) done = new List<PendingUp>();
-                done.Add(p);
+            for (int i = 0; i < pendingEvents.Count; ) {
+                PendingEvent p = pendingEvents[i];
+                if (p.Probe) {
+                    int v = RawSink.FindRecent(p.Vk, true, p.HookTick - 30, now);
+                    if (v < 0) v = RawSink.FindRecent(p.RealVk, true, p.HookTick - 30, now);   // raw kept the original vk
+                    if (v < 0 && now - p.HookTick < 500) break;  // probes are ordered: wait for its WM_INPUT
+                    if (v < 0) v = 0;                            // sink blind -> physical, consistent with the global default
+                    probeVerdict[p.RealVk] = v;                  // publish first: the hook stops passing repeats right away
+                    releaseProbeVk = true;                       // retire the harmless F24 press the app received
+                    Log.Info("[INPUT] 重复键探测 0x" + p.RealVk.ToString("X2") + " -> " +
+                             (v == 1 ? "遥控器（补装引擎，后续重复键转吞）" : "物理键盘（重复键持续放行）"));
+                    if (v == 1) {
+                        NoteRemoteKey(p.RealVk, true);           // remote mid-hold: light the held key
+                        armedPresses[p.RealVk] = true;
+                        if (armings == null) armings = new List<PendingEvent>();
+                        armings.Add(p);
+                    }
+                    pendingEvents.RemoveAt(i);
+                    continue;
+                }
+                int verdict;
+                bool known;
+                bool armed;
+                if (p.Probing) {
+                    known = probeVerdict.TryGetValue(p.Vk, out verdict);
+                    if (!known) break;                           // its probe is still unresolved (head of line)
+                    armed = armedPresses.TryGetValue(p.Vk, out armed) && armed;
+                    armedPresses.Remove(p.Vk);
+                    probeVerdict.Remove(p.Vk);
+                    pendingEvents.RemoveAt(i);
+                    if (armed) {
+                        // engine already holds the real press: just complete it
+                        // (fires hold-through release; a click was already handled)
+                        if (engineCompletions == null) engineCompletions = new List<PendingEvent>();
+                        engineCompletions.Add(p);
+                    }                                            // physical: repeats + up were real, nothing to do
+                    continue;
+                }
+                verdict = RawSink.FindRecent(p.Vk, false, p.HookTick - 30, now);
+                if (verdict < 0 && now - p.HookTick < 500) break;
+                pendingEvents.RemoveAt(i);
+                if (verdict == 1) {                              // click: synthesize the press the hook swallowed
+                    if (remoteClicks == null) remoteClicks = new List<PendingEvent>();
+                    remoteClicks.Add(p);
+                } else {                                         // physical click: give back the original key (injected)
+                    if (physicalTaps == null) physicalTaps = new List<ushort>();
+                    physicalTaps.Add(p.Vk);
+                }
             }
         }
-        if (done == null) return;
-        for (int i = 0; i < done.Count; i++) {
-            PendingUp p = done[i];
-            if (p.Verdict == 1) {
-                long tick = NowMs();
-                mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = p.Vk, Down = true, TickMs = tick });
-                mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = p.Vk, Down = false, TickMs = tick + 1 });
-            } else {
-                KeySender.Tap(new ushort[] { p.Vk });            // injected -> hook ignores, hDevice=0 votes for neither side
+        // injections and engine work happen OUTSIDE pendingGate: the hook thread
+        // waits on that lock, and SendInput inside it would stall all input
+        if (releaseProbeVk) KeySender.Release(new ushort[] { PROBE_VK });   // injected -> hook ignores
+        var act = new List<GestureEngine.OutAction>();
+        if (armings != null) {
+            for (int i = 0; i < armings.Count; i++) {
+                // remote mid-hold: arm the engine with the REAL press, backdated
+                // so the hold threshold lands on real time
+                lock (mapGate) {
+                    engine.Feed(armings[i].RealVk, true, armings[i].DownTick, act);
+                    engine.Tick(NowMs(), act);
+                }
+                Flush(act);
             }
-            Log.Info("[INPUT] 延迟归因 0x" + p.Vk.ToString("X2") + " -> " + (p.Verdict == 1 ? "遥控器（补发映射动作）" : "物理键盘（还原原键）"));
+        }
+        if (engineCompletions != null) {
+            for (int i = 0; i < engineCompletions.Count; i++) {
+                lock (mapGate) engine.Feed(engineCompletions[i].Vk, false, NowMs(), act);
+                Flush(act);
+            }
+        }
+        if (remoteClicks != null) {
+            for (int i = 0; i < remoteClicks.Count; i++) {
+                ushort vk = remoteClicks[i].Vk;
+                long tick = NowMs();
+                NoteRemoteKey(vk, true);                         // the DOWN was swallowed silently: light now
+                mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = vk, Down = true, TickMs = tick });
+                mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = vk, Down = false, TickMs = tick + 1 });
+                Log.Info("[INPUT] 延迟归因 0x" + vk.ToString("X2") + " -> 遥控器（补发映射动作）");
+            }
+        }
+        if (physicalTaps != null) {
+            for (int i = 0; i < physicalTaps.Count; i++) {
+                KeySender.Tap(new ushort[] { physicalTaps[i] }); // injected -> hook ignores, hDevice=0 votes for neither side
+                Log.Info("[INPUT] 延迟归因 0x" + physicalTaps[i].ToString("X2") + " -> 物理键盘（还原原键）");
+            }
         }
     }
 
@@ -198,14 +360,22 @@ static class InputRouter {
             pumpTid = GetCurrentThreadId();
             hhk = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
             Log.Info("[INPUT] router armed (blockF5 " + (blockF5 ? "on" : "off") +
-                     ", mapping " + (mappingEnabled ? "on" : "off") + " while linked)");
+                     ", mapping " + (mappingEnabled ? "on" : "off") + " while linked)" +
+                     " hook=0x" + hhk.ToString("X") +
+                     (hhk == IntPtr.Zero ? " FAILED err=" + Marshal.GetLastWin32Error() : ""));
             MSG m;
             while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) {
-                if (m.message == WM_APP_REHOOK && hhk == IntPtr.Zero && suspendDepth == 0)
+                if (m.message == WM_APP_REHOOK && hhk == IntPtr.Zero) {
+                    // safety net for a hook that vanished for any reason (system
+                    // policy, watchdog repost); normally never taken
                     hhk = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
+                    Log.Info("[INPUT] hook reinstalled 0x" + hhk.ToString("X") +
+                             (hhk == IntPtr.Zero ? " FAILED err=" + Marshal.GetLastWin32Error() : ""));
+                }
                 TranslateMessage(ref m);
                 DispatchMessage(ref m);
             }
+            Log.Error("[INPUT] pump exited - keyboard hook lost (GetMessage returned <= 0)");
         }) { IsBackground = true, Name = "inputrouter" };
         pump.Start();
         RawSink.Start();
@@ -216,6 +386,12 @@ static class InputRouter {
                     GestureEngine.RawEvent ev;
                     while (mapQueue.TryTake(out ev, 20)) {
                         try {
+                            if (ev.ReleaseAll) {            // link drop / table swap: release held combos
+                                var rel = new List<GestureEngine.OutAction>();
+                                lock (mapGate) engine.Reset(rel);
+                                Flush(rel);
+                                continue;
+                            }
                             lock (mapGate) engine.Feed(ev.Vk, ev.Down, ev.TickMs, pending);
                             Flush(pending);
                         } catch (Exception ex) { Log.Error("[INPUT] worker: " + ex.Message); }
@@ -224,7 +400,15 @@ static class InputRouter {
                         lock (mapGate) engine.Tick(NowMs(), pending);
                         Flush(pending);
                     } catch (Exception ex) { Log.Error("[INPUT] tick: " + ex.Message); }
-                    try { ResolvePendingUps(); } catch (Exception ex) { Log.Error("[INPUT] pending: " + ex.Message); }
+                    try { ResolvePendingEvents(); } catch (Exception ex) { Log.Error("[INPUT] pending: " + ex.Message); }
+                    // watchdog: if the hook vanished for any reason while the
+                    // remote is linked, ask the pump to reinstall (self-heal ~1s)
+                    if (linked && hhk == IntPtr.Zero &&
+                        Math.Abs(Environment.TickCount - lastHookMissingTick) > 1000) {
+                        lastHookMissingTick = Environment.TickCount;
+                        Log.Warn("[INPUT] watchdog: hook missing while linked -> repost rehook");
+                        PostThreadMessage(pumpTid, WM_APP_REHOOK, IntPtr.Zero, IntPtr.Zero);
+                    }
                 }
             }) { IsBackground = true, Name = "keymap" };
             mapWorker.Start();
@@ -236,23 +420,56 @@ static class InputRouter {
         RawSink.Stop();
     }
 
+    /// Unit-test hook: publish a repeat-probe verdict as the worker would.
+    internal static void TestSetProbeVerdict(uint vk, int verdict) {
+        lock (pendingGate) probeVerdict[(ushort)vk] = verdict;
+    }
+
     public static void SetBlockF5(bool on) { blockF5 = on; }
-    public static void SetLinked(bool on) { linked = on; }
+    public static void SetLinked(bool on) {
+        linked = on;
+        if (!on) ReleaseEngineHolds();                      // remote gone mid-press: release its combos
+    }
     public static void SetMappingEnabled(bool on) { mappingEnabled = on; }
 
     /// Swap in a new mapping table (config edit / preset load). Safe at any time.
     public static void SetKeyMap(KeyMapConfig map) { SetKeyMap(map, null); }
 
     public static void SetKeyMap(KeyMapConfig map, string macPrefix) {
-        if (map == null) { mappingEnabled = false; return; }
+        if (map == null) {
+            mappingEnabled = false;
+            vkToId = new Dictionary<ushort, string>();     // no table -> nothing lights
+            ReleaseEngineHolds();                          // old table may still hold combos down
+            return;
+        }
         List<KeyMapEntry> bound = new List<KeyMapEntry>();
-        foreach (KeyMapEntry e in map.keys) if (e != null && e.Mapped) bound.Add(e);
+        var table = new Dictionary<ushort, string>();      // ALL keys, mapped or not:
+        foreach (KeyMapEntry e in map.keys) {              // an unmapped key still passes
+            if (e == null) continue;                       // the hook and must light the art
+            if (e.Mapped) bound.Add(e);
+            ushort vk = e.VkCode;
+            if (vk != 0 && !table.ContainsKey(vk)) table[vk] = e.id;
+        }
+        var releases = new List<GestureEngine.OutAction>();
         lock (mapGate) {
+            engine.Reset(releases);                        // stuck hold-through combos from the old table
             engine = new GestureEngine(bound.ToArray());
             mappingEnabled = map.enabled && bound.Count > 0;
             RawSink.SetMatchers(map.matchVidPid, macPrefix);
         }
+        vkToId = table;
+        Flush(releases);                                   // SendInput outside mapGate
         Log.Info("[INPUT] keymap: " + bound.Count + " mapped key(s), " + (mappingEnabled ? "enabled" : "disabled"));
+    }
+
+    /// Drop deferred-press bookkeeping and queue a sentinel so the map worker
+    /// releases every combo the gesture engine currently holds (the matching
+    /// UP will never arrive once the remote is gone or the table is swapped).
+    /// The hook-owned "pending" dict is left alone - it self-heals on the next
+    /// UP of the same key.
+    static void ReleaseEngineHolds() {
+        lock (pendingGate) { pendingEvents.Clear(); probeVerdict.Clear(); armedPresses.Clear(); }
+        mapQueue.TryAdd(new GestureEngine.RawEvent { ReleaseAll = true });
     }
 
     static void Flush(List<GestureEngine.OutAction> actions) {
@@ -315,24 +532,20 @@ static class InputRouter {
         args = command.Substring(sp + 1).Trim();
     }
 
-    // ---- injection-time hook suspension (shared with HotkeyInjector) -------
-    static int suspendDepth;
-    public static void Suspend() {
-        if (Interlocked.Increment(ref suspendDepth) == 1 && hhk != IntPtr.Zero) {
-            UnhookWindowsHookEx(hhk); hhk = IntPtr.Zero;
-        }
-    }
-    public static void Resume() {
-        if (Interlocked.Decrement(ref suspendDepth) == 0 && pumpTid != 0)
-            PostThreadMessage(pumpTid, WM_APP_REHOOK, IntPtr.Zero, IntPtr.Zero);
-    }
+    // ---- injection-time hook policy -----------------------------------------
+    // The hook is NEVER unhooked around injections (see the class header of
+    // HotkeyInjector / the real-device log of 2026-09-07: unhook+rehook cycles
+    // intermittently lost or zombified the hook). HookCb filters injected keys
+    // via LLKHF_INJECTED, so our own SendInput can never re-enter it. The
+    // watchdog below only guards against the hook vanishing for other reasons.
+    static int lastHookMissingTick;       // mapWorker only: watchdog throttle
 }
 
 // ---- gesture engine (pure logic, unit-testable) ---------------------------
 sealed class GestureEngine {
     public enum Phase { Down, Up, Once }
 
-    public struct RawEvent { public ushort Vk; public bool Down; public long TickMs; }
+    public struct RawEvent { public ushort Vk; public bool Down; public long TickMs; public bool ReleaseAll; }
 
     public struct OutAction { public string EntryId; public string EntryName; public KeyMapAction Action; public Phase Phase; }
 
@@ -416,6 +629,26 @@ sealed class GestureEngine {
         }
     }
 
+    /// Release everything the engine currently holds WITHOUT firing pending
+    /// actions (link drop / mapping-table swap: the real UP is never coming,
+    /// and a half-press must not trigger an action on the way out). Only
+    /// combos whose Down phase already went out get their Up.
+    public void Reset(List<OutAction> out_) {
+        foreach (var kv in states) {
+            KeyState st = kv.Value;
+            if (st.DownSince == 0) continue;
+            KeyMapEntry e = st.Entry;
+            if (st.HoldFired) {
+                if (e.hold != null && e.hold.Kind == MapActionKind.Combo && !e.hold.tap)
+                    out_.Add(Make(e, e.hold, Phase.Up));
+            } else if (!st.Armed) {
+                if (e.click != null && e.click.Kind == MapActionKind.Combo && !e.click.tap)
+                    out_.Add(Make(e, e.click, Phase.Up));
+            }
+            st.DownSince = 0; st.Armed = false; st.HoldFired = false;
+        }
+    }
+
     static OutAction Make(KeyMapEntry e, KeyMapAction a, Phase p) {
         OutAction o;
         o.EntryId = e.id; o.EntryName = e.name; o.Action = a; o.Phase = p;
@@ -460,22 +693,19 @@ static class KeySender {
 
     public static void Press(ushort[] keys) { SendAll(keys, true); }
     public static void Release(ushort[] keys) { SendAll(keys, false); }
+    internal static ushort ScanOf(ushort vk) { return (ushort)MapVirtualKey(vk, 0); }
     public static void Tap(ushort[] keys) {
         var inputs = new List<INPUT>();
         for (int i = 0; i < keys.Length; i++) inputs.Add(Make(keys[i], true));
         for (int i = keys.Length - 1; i >= 0; i--) inputs.Add(Make(keys[i], false));
-        InputRouter.Suspend();
-        try { SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT))); }
-        finally { InputRouter.Resume(); }
+        SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT)));
     }
 
     static void SendAll(ushort[] keys, bool down) {
         var inputs = new INPUT[keys.Length];
         int idx = 0;
         for (int i = 0; i < keys.Length; i++) inputs[idx++] = down ? Make(keys[i], true) : Make(keys[keys.Length - 1 - i], false);
-        InputRouter.Suspend();
-        try { SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT))); }
-        finally { InputRouter.Resume(); }
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 }
 
@@ -491,7 +721,9 @@ static class RawSink {
     [DllImport("user32.dll")] static extern uint GetRawInputDeviceInfo(IntPtr hDevice, uint uiCommand, System.Text.StringBuilder pData, ref uint pcbSize);
     [DllImport("user32.dll")] static extern uint GetRawInputDeviceList([Out] RAWINPUTDEVICELIST[] list, ref uint count, uint size);
 
+#pragma warning disable 649   // filled by GetRawInputDeviceList via marshaling
     struct RAWINPUTDEVICELIST { public IntPtr hDevice; public uint dwType; }
+#pragma warning restore 649
 
     /// Startup visibility: list every raw-input keyboard and mark which one
     /// attribution picks as the remote (goes to MiVoiceMic.log).
@@ -548,7 +780,12 @@ static class RawSink {
     [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
     [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
     [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
+    [DllImport("user32.dll")] static extern bool PostThreadMessage(uint tid, uint msg, IntPtr w, IntPtr l);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int px, py; }
+
+    const uint WM_QUIT = 0x0012;
+    static uint sinkTid;                                   // rawsink thread id (for Stop)
 
     static Thread thread;
     static IntPtr hwnd = IntPtr.Zero;
@@ -625,6 +862,7 @@ static class RawSink {
         lock (ringGate) matchers = BuildMatchers(vidPid, macPrefix);   // re-derive (config may have landed before Start)
         if (thread != null) return;
         thread = new Thread((ThreadStart)delegate {
+            sinkTid = GetCurrentThreadId();
             var wc = new WNDCLASS();
             wc.lpfnWndProc = proc;
             wc.hInstance = GetModuleHandle(null);
@@ -651,12 +889,14 @@ static class RawSink {
             LogRawKeyboards();
             MSG m;
             while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { TranslateMessage(ref m); DispatchMessage(ref m); }
+            DestroyWindow(hwnd);      // our own window: DestroyWindow must run on its creating thread
+            hwnd = IntPtr.Zero;
         }) { IsBackground = true, Name = "rawsink" };
         thread.Start();
     }
 
     public static void Stop() {
-        if (hwnd != IntPtr.Zero) { DestroyWindow(hwnd); hwnd = IntPtr.Zero; }
+        if (sinkTid != 0) PostThreadMessage(sinkTid, WM_QUIT, IntPtr.Zero, IntPtr.Zero);   // lets the thread unregister/destroy cleanly
     }
 
     static IntPtr SinkProc(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam) {
@@ -673,10 +913,13 @@ static class RawSink {
                     var raw = (RAWINPUT)Marshal.PtrToStructure(buf, typeof(RAWINPUT));
                     if (raw.header.dwType == 1) {              // RIM_TYPEKEYBOARD
                         bool down = raw.keyboard.Message == 0x0100 || raw.keyboard.Message == 0x0104;
+                        // normalize the driver voice key (F20) to F5 so the ring
+                        // correlates with the hook's normalized vk (probe path)
+                        ushort vk = (ushort)InputRouter.NormalizeVoiceKey(raw.keyboard.VKey);
                         bool remote = DeviceIsRemote(raw.header.hDevice);
                         long tick = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
                         lock (ringGate) {
-                            ring[ringHead].Vk = raw.keyboard.VKey;
+                            ring[ringHead].Vk = vk;
                             ring[ringHead].Down = down;
                             ring[ringHead].Tick = tick;
                             ring[ringHead].Remote = remote;
@@ -684,10 +927,11 @@ static class RawSink {
                             if (remote) lastRemoteTick = tick;
                             else if (raw.header.hDevice != IntPtr.Zero) lastForeignTick = tick;
                         }
+                        if (remote) InputRouter.NoteRemoteKey(vk, down);   // passed remote key: light on down, dark on up (per-event truth)
                         int t = Environment.TickCount;         // diagnosis: remote keys only - otherwise every physical keystroke floods the log
                         if (remote && (t - lastEvtLog > 400 || t < lastEvtLog)) {
                             lastEvtLog = t;
-                            Log.Info("[INPUT] wm_input vk=0x" + raw.keyboard.VKey.ToString("X2") +
+                            Log.Info("[INPUT] wm_input vk=0x" + vk.ToString("X2") +
                                      (down ? " down" : " up") + " dev=0x" + raw.header.hDevice.ToString("X") +
                                      " remote=" + (remote ? 1 : 0));
                         }

@@ -375,6 +375,15 @@ static class RemotePainter {
     static readonly Color DotColor = Color.FromArgb(96, 96, 104);
 
     public static void Draw(Graphics g, RectangleF area, bool talking, string flashKey) {
+        Draw(g, area, talking, flashKey, null);
+    }
+
+    /// <param name="lit">key ids currently lit by live remote key activity
+    /// (pressed/held); rendered like the action flash, for every key.</param>
+    public static void Draw(Graphics g, RectangleF area, bool talking, string flashKey, ICollection<string> lit) {
+        Func<string, bool> hot = delegate (string id) {
+            return flashKey == id || (lit != null && lit.Contains(id));
+        };
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
         float k = Math.Min(area.Width / VW, area.Height / VH);
@@ -384,15 +393,17 @@ static class RemotePainter {
             return new PointF(ox + vx * k, oy + vy * k);
         };
         using (Pen glyphPen = new Pen(Glyph, Math.Max(1.2f, 1.5f * k)))
-        using (Pen dimPen = new Pen(GlyphDim, Math.Max(1.1f, 1.3f * k))) {
+        using (Pen dimPen = new Pen(GlyphDim, Math.Max(1.1f, 1.3f * k)))
+        using (Pen hotPen = new Pen(MacTheme.Accent, Math.Max(1.4f, 1.8f * k))) {
             glyphPen.StartCap = LineCap.Round; glyphPen.EndCap = LineCap.Round;
             dimPen.StartCap = LineCap.Round; dimPen.EndCap = LineCap.Round;
+            hotPen.StartCap = LineCap.Round; hotPen.EndCap = LineCap.Round;
 
-            // dark circular key (bottom grid)
-            Action<float, float, float> circleKey = delegate (float cx, float cy, float r) {
+            // dark circular key (bottom grid); hot = accent ring like the OK key
+            Action<float, float, float, bool> circleKey = delegate (float cx, float cy, float r, bool isHot) {
                 var rc = new RectangleF(M(cx - r, cy - r).X, M(cx - r, cy - r).Y, 2 * r * k, 2 * r * k);
                 using (var b = new LinearGradientBrush(rc, Color.FromArgb(52, 52, 56), KeyDark, 55f)) g.FillEllipse(b, rc);
-                using (var p2 = new Pen(KeyDarkEdge)) g.DrawEllipse(p2, rc);
+                using (var p2 = new Pen(isHot ? MacTheme.Accent : KeyDarkEdge, isHot ? Math.Max(1.4f, 1.8f * k) : 1f)) g.DrawEllipse(p2, rc);
             };
 
             // ---- body ----
@@ -403,13 +414,13 @@ static class RemotePainter {
             }
 
             // ---- top row: power (dead) + voice ----
-            circleKey(30, 30, 9.5f);
+            circleKey(30, 30, 9.5f, hot("power"));
             {
                 var c = M(30, 30);
                 g.DrawArc(dimPen, c.X - 4 * k, c.Y - 4 * k, 8 * k, 8 * k, -50, 285);
                 g.DrawLine(dimPen, c.X, c.Y - 6.5f * k, c.X, c.Y - 1.5f * k);
             }
-            bool voiceHot = talking || flashKey == "voice";
+            bool voiceHot = talking || hot("voice");
             {
                 var rc = new RectangleF(M(60.5f, 20.5f).X, M(60.5f, 20.5f).Y, 19 * k, 19 * k);
                 using (var b = new SolidBrush(voiceHot ? MacTheme.Accent : Color.FromArgb(52, 52, 56))) g.FillEllipse(b, rc);
@@ -431,37 +442,39 @@ static class RemotePainter {
                 using (var lg = new LinearGradientBrush(rc, Color.FromArgb(58, 58, 63), Color.FromArgb(34, 34, 37), 90f)) g.FillEllipse(lg, rc);
                 using (var p2 = new Pen(KeyDarkEdge, Math.Max(1f, 1.2f * k))) g.DrawEllipse(p2, rc);
             }
-            // D-pad edge dots (tiny, like the hardware); flash ring for the active direction
-            PointF[] dots = new PointF[] { new PointF(50f, 77f), new PointF(50f, 133f), new PointF(22f, 105f), new PointF(78f, 105f) };
-            foreach (PointF d in dots) {
+            // D-pad edge dots (tiny, like the hardware); ring for the active direction
+            string[] dotIds = { "up", "down", "left", "right" };
+            for (int i = 0; i < dotIds.Length; i++) {
+                var d = spots[dotIds[i]];
                 var c = M(d.X, d.Y);
-                bool hot = flashKey != null && spots.ContainsKey(flashKey) && spots[flashKey].Equals(d);
+                bool hotDot = hot(dotIds[i]);
                 float dr = Math.Max(1.5f, 1.6f * k);
-                using (var b = new SolidBrush(hot ? MacTheme.Accent : DotColor))
+                using (var b = new SolidBrush(hotDot ? MacTheme.Accent : DotColor))
                     g.FillEllipse(b, c.X - dr, c.Y - dr, dr * 2, dr * 2);
             }
-            if (flashKey == "up" || flashKey == "down" || flashKey == "left" || flashKey == "right") {
-                PointF h = spots[flashKey];
+            string dirHot = hot("up") ? "up" : hot("down") ? "down" : hot("left") ? "left" : hot("right") ? "right" : null;
+            if (dirHot != null) {
+                PointF h = spots[dirHot];
                 var c = M(h.X, h.Y);
                 using (var p2 = new Pen(MacTheme.Accent, Math.Max(1.6f, 2f * k))) g.DrawEllipse(p2, c.X - 7 * k, c.Y - 7 * k, 14 * k, 14 * k);
             }
             // OK center
             {
                 var rc = new RectangleF(M(36, 91).X, M(36, 91).Y, 28 * k, 28 * k);
-                bool okHot = flashKey == "ok";
+                bool okHot = hot("ok");
                 using (var lg = new LinearGradientBrush(rc, Color.FromArgb(64, 64, 70), Color.FromArgb(44, 44, 48), 90f)) g.FillEllipse(lg, rc);
                 using (var p2 = new Pen(okHot ? MacTheme.Accent : Color.FromArgb(24, 24, 26), Math.Max(1f, okHot ? 2f * k : 1.2f * k))) g.DrawEllipse(p2, rc);
                 DrawCentered(g, "OK", MacTheme.Font(8.5f, FontStyle.Bold), okHot ? MacTheme.Accent : Color.FromArgb(168, 168, 176), rc);
             }
 
             // ---- bottom grid: left column back / home / menu ----
-            circleKey(31, 172, 13f);
+            circleKey(31, 172, 13f, hot("back"));
             {
                 var c = M(31, 172);
                 g.DrawLine(glyphPen, c.X + 2.5f * k, c.Y - 5f * k, c.X - 2.5f * k, c.Y);
                 g.DrawLine(glyphPen, c.X - 2.5f * k, c.Y, c.X + 2.5f * k, c.Y + 5f * k);
             }
-            circleKey(31, 212, 13f);
+            circleKey(31, 212, 13f, hot("home"));
             {
                 var c = M(31, 212);
                 g.DrawLine(glyphPen, c.X - 5.5f * k, c.Y + 0.5f * k, c.X, c.Y - 5f * k);
@@ -470,7 +483,7 @@ static class RemotePainter {
                 g.DrawLine(glyphPen, c.X + 4f * k, c.Y - 1f * k, c.X + 4f * k, c.Y + 5f * k);
                 g.DrawLine(glyphPen, c.X - 4f * k, c.Y + 5f * k, c.X + 4f * k, c.Y + 5f * k);
             }
-            circleKey(31, 252, 13f);
+            circleKey(31, 252, 13f, hot("menu"));
             {
                 var c = M(31, 252);
                 for (int i = -1; i <= 1; i++)
@@ -479,18 +492,20 @@ static class RemotePainter {
 
             // ---- bottom grid: right column vol pill (+ / -) and TV ----
             {
+                bool volUpHot = hot("volup"), volDownHot = hot("voldown");
                 var pill = new RectangleF(M(55, 160).X, M(55, 160).Y, 30 * k, 64 * k);
                 using (var path = RoundedF(pill, (int)Math.Max(1, 15 * k))) {
                     using (var lg = new LinearGradientBrush(pill, Color.FromArgb(52, 52, 56), KeyDark, 55f)) g.FillPath(lg, path);
-                    using (var p2 = new Pen(KeyDarkEdge)) g.DrawPath(p2, path);
+                    using (var p2 = new Pen(volUpHot || volDownHot ? MacTheme.Accent : KeyDarkEdge, volUpHot || volDownHot ? Math.Max(1.4f, 1.8f * k) : 1f)) g.DrawPath(p2, path);
                 }
                 var cp = M(70, 176);
-                g.DrawLine(glyphPen, cp.X - 4.5f * k, cp.Y, cp.X + 4.5f * k, cp.Y);
-                g.DrawLine(glyphPen, cp.X, cp.Y - 4.5f * k, cp.X, cp.Y + 4.5f * k);
+                Pen vp = volUpHot ? hotPen : glyphPen;           // borrowed, NOT disposed here - glyphPen draws the TV glyph below
+                g.DrawLine(vp, cp.X - 4.5f * k, cp.Y, cp.X + 4.5f * k, cp.Y);
+                g.DrawLine(vp, cp.X, cp.Y - 4.5f * k, cp.X, cp.Y + 4.5f * k);
                 var cm = M(70, 208);
-                g.DrawLine(glyphPen, cm.X - 4.5f * k, cm.Y, cm.X + 4.5f * k, cm.Y);
+                g.DrawLine(volDownHot ? hotPen : glyphPen, cm.X - 4.5f * k, cm.Y, cm.X + 4.5f * k, cm.Y);
             }
-            circleKey(70, 252, 13f);
+            circleKey(70, 252, 13f, hot("tv"));
             {
                 var c = M(70, 252);
                 using (var p2 = (Pen)glyphPen) {
@@ -530,8 +545,6 @@ static class RemotePainter {
 }
 
 // ---- combo capture box -------------------------------------------------------
-// Click to arm, press the desired combo (Win keys included - captured via a
-// temporary WH_KEYBOARD_LL on the UI thread), Esc cancels.// ---- combo capture box -------------------------------------------------------
 // Focus-based combo capture: clicking focuses the control; the pressed key
 // (WinForms KeyDown) plus its modifiers become the combo. No global keyboard
 // hook involved - this survives dialogs, AV software and IME interference.

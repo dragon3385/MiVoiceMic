@@ -150,7 +150,11 @@ class Config {
         root["keymap"] = keymap;
         root["stats"] = stats;
         try {
-            File.WriteAllText(ConfigPath, ser.Serialize(root), System.Text.Encoding.UTF8);
+            // atomic replace: a crash mid-write must never leave a half config
+            string path = ConfigPath, tmp = path + ".tmp";
+            File.WriteAllText(tmp, ser.Serialize(root), System.Text.Encoding.UTF8);
+            if (File.Exists(path)) File.Replace(tmp, path, null);
+            else File.Move(tmp, path);
         } catch (Exception ex) {
             Log.Error("config: save failed: " + ex.Message);
         }

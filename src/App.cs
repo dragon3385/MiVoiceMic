@@ -14,6 +14,7 @@ sealed class App : BleVoiceLink.IHandler {
     readonly AudioOut audioOut = new AudioOut();
     readonly DeviceSwitcher switcher = new DeviceSwitcher();
     HotkeyInjector injector;
+    HotkeyInjector pendingInjector;    // hotkey edited mid-session: swapped in after release
 
     // key/voice action worker (never inject SendInput from hook or WinRT threads)
     enum KeyActionKind { VoiceDown, VoiceUp }
@@ -110,10 +111,12 @@ sealed class App : BleVoiceLink.IHandler {
 
     /// Re-apply config changes that can take effect at runtime.
     public void ApplyConfig(Config updated) {
-        injector = new HotkeyInjector(updated.hotkey.keys, updated.hotkey.mode);
+        var next = new HotkeyInjector(updated.hotkey.keys, updated.hotkey.mode);
+        if (talking && hotkeyHeld) pendingInjector = next;   // the held combo must be released by the injector that pressed it
+        else injector = next;
         InputRouter.SetBlockF5(updated.blockF5);
         InputRouter.SetKeyMap(updated.keymap, updated.deviceMacPrefix);
-        Log.Info("[CFG] 热键: " + injector.Describe() + " | 拦截F5: " + (updated.blockF5 ? "开" : "关") +
+        Log.Info("[CFG] 热键: " + next.Describe() + " | 拦截F5: " + (updated.blockF5 ? "开" : "关") +
                  " | 按键映射: " + (updated.keymap.enabled ? "开" : "关"));
     }
 
@@ -129,6 +132,10 @@ sealed class App : BleVoiceLink.IHandler {
                 } else {
                     if (cfg.hotkeyEnabled) injector.OnVoiceUp();
                     switcher.Restore();
+                    if (pendingInjector != null) {             // release was sent with the OLD combo; now swap
+                        injector = pendingInjector;
+                        pendingInjector = null;
+                    }
                 }
             } catch (Exception ex) { Log.Error("[KEY] worker: " + ex.Message); }
         }

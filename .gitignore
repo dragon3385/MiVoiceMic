@@ -6,6 +6,7 @@ MiVoiceMic.new.exe
 MiVoiceMic.log
 dump_*.wav
 config.json
+config.json.tmp
 
 # scratch screenshots (docs/screenshots is the curated set)
 shots/

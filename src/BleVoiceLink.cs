@@ -62,6 +62,7 @@ sealed class BleVoiceLink {
     readonly Config cfg;
     readonly IHandler handler;
     CancellationTokenSource cts;
+    int generation;        // bumped per Start/Reconnect: retires still-running old loops
 
     BluetoothLEDevice device;
     GattDeviceService svcAtvv, svcBattery;
@@ -92,7 +93,9 @@ sealed class BleVoiceLink {
     public void Start() {
         if (cts != null) return;
         cts = new CancellationTokenSource();
-        Task.Run((Action)delegate { LinkLoop(cts.Token); });
+        int gen = ++generation;
+        CancellationToken token = cts.Token;
+        Task.Run((Action)delegate { LinkLoop(token, gen); });
     }
 
     public void Stop() {
@@ -107,20 +110,27 @@ sealed class BleVoiceLink {
         Cleanup();
         if (keepalive != null) { try { keepalive.Dispose(); } catch { } keepalive = null; }
         cts = new CancellationTokenSource();
+        int gen = ++generation;
         CancellationToken token = cts.Token;
-        Task.Run((Action)delegate { LinkLoop(token); });
+        Task.Run((Action)delegate { LinkLoop(token, gen); });
+    }
+
+    void EnsureCurrent(int gen) {
+        if (gen != generation) throw new OperationCanceledException("link loop superseded");
     }
 
     // ======================= link loop =======================
 
-    async void LinkLoop(CancellationToken token) {
+    async void LinkLoop(CancellationToken token, int gen) {
         int failures = 0;
-        while (!token.IsCancellationRequested) {
+        while (!token.IsCancellationRequested && gen == generation) {
             bool failed = false;
             string error = null;
             try {
                 var di = await FindPairedRemote(token);
+                if (gen != generation) return;
                 if (di == null && cfg.autoPair) di = await TryFindAndPairAdvertising(token);
+                if (gen != generation) return;
                 if (di == null) {
                     handler.OnLinkState(false, "未找到遥控器（先完成蓝牙配对；或按住遥控器任意键唤醒）");
                     await Delay(3.0, token);
@@ -130,6 +140,10 @@ sealed class BleVoiceLink {
                 handler.OnLinkState(false, "正在连接 " + di.Name + " ...");
 
                 var dev = await AsT(BluetoothLEDevice.FromIdAsync(di.Id));
+                if (gen != generation) {                    // stale loop: dispose only OUR object, never shared Cleanup()
+                    if (dev != null) { try { dev.Dispose(); } catch { } }
+                    return;
+                }
                 if (dev == null) throw new Exception("FromIdAsync returned null");
                 device = dev;
                 RemoteName = string.IsNullOrEmpty(dev.Name) ? di.Name : dev.Name;
@@ -137,8 +151,9 @@ sealed class BleVoiceLink {
                 dev.ConnectionStatusChanged += OnConnectionChanged;   // works with System.Runtime.InteropServices.WindowsRuntime referenced
                 TryMaintainConnection(dev);
 
-                await SetupGatt(token);
-                await Handshake(token);
+                await SetupGatt(token, gen);
+                await Handshake(token, gen);
+                EnsureCurrent(gen);                         // never mark linked if a newer loop took over
 
                 linked = true;
                 micOpen = true;   // MIC_OPEN sent; remote signals sessions via CTL
@@ -149,9 +164,11 @@ sealed class BleVoiceLink {
                 keepalive = new Timer(KeepaliveTick, null, 5000, 5000);
                 return;   // supervision continues via events
             } catch (Exception ex) {
+                if (gen != generation) return;              // superseded: stay silent, touch nothing shared
                 failed = true;
                 error = ex.Message;
             }
+            if (gen != generation) return;
             if (failed && !token.IsCancellationRequested) {
                 failures++;
                 Log.Warn("[BLE] link attempt failed: " + error);
@@ -301,15 +318,17 @@ sealed class BleVoiceLink {
 
     // ======================= GATT + handshake =======================
 
-    async Task SetupGatt(CancellationToken token) {
+    async Task SetupGatt(CancellationToken token, int gen) {
         GattCharacteristic cmd = null, aud = null, ctl = null;
         GattDeviceService svc = null;
         for (int attempt = 0; attempt < 5; attempt++) {
             var svcRes = await AsT(device.GetGattServicesAsync(BluetoothCacheMode.Uncached));
+            EnsureCurrent(gen);
             if (svcRes != null) {
                 svc = svcRes.Services.FirstOrDefault(s => s.Uuid == SVC);
                 if (svc != null) {
                     var chRes = await AsT(svc.GetCharacteristicsAsync(BluetoothCacheMode.Uncached));
+                    EnsureCurrent(gen);
                     if (chRes != null) {
                         cmd = chRes.Characteristics.FirstOrDefault(c => c.Uuid == C_CMD);
                         aud = chRes.Characteristics.FirstOrDefault(c => c.Uuid == C_AUD);
@@ -322,8 +341,9 @@ sealed class BleVoiceLink {
             await Delay(1.0, token);
         }
         if (cmd == null || aud == null || ctl == null)
-            throw new Exception("ATVV 服务未找到 (设备可能未正确配对，或不是小米蓝牙语音遥控器)");
+            throw new Exception("ATVV 服务未找到 (检查系统配对；若遥控器正连接电视/盒子请先断开；按任意键唤醒后重试)");
 
+        EnsureCurrent(gen);
         svcAtvv = svc; chCmd = cmd; this.chAud = aud; this.chCtl = ctl;
         HookValueChanged(ctl, CtlHandler);
         HookValueChanged(aud, AudioHandler);
@@ -333,13 +353,14 @@ sealed class BleVoiceLink {
             throw new Exception("订阅 ATVV 通知失败: ctl=" + r1 + " aud=" + r2);
     }
 
-    async Task Handshake(CancellationToken token) {
+    async Task Handshake(CancellationToken token, int gen) {
         // GET_CAPS v1.0 (both known remotes speak this)
         await WriteCmd(new byte[] { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 });
         var capsWait = new TaskCompletionSource<bool>();
         capsPending = capsWait;
         capsError = null;
         var done = await Task.WhenAny(capsWait.Task, Task.Delay(4000, token));
+        EnsureCurrent(gen);
         capsPending = null;
         if (done != capsWait.Task)
             throw new Exception("CAPS 无响应 (遥控器未应答，尝试按任意键唤醒后重启应用)");

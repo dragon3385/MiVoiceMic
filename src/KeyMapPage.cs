@@ -78,6 +78,7 @@ class MapCanvas : Control {
     public Action RequestEnableMapping;
     string flashId;
     int flashTick;
+    bool hadLit;                                           // art had lit keys on the previous tick
     Timer flashTimer;
 
     // card placement mirrors the remote's physical layout so lines never cross:
@@ -95,8 +96,12 @@ class MapCanvas : Control {
         RebuildCards();
         flashTimer = new Timer { Interval = 120 };
         flashTimer.Tick += delegate {
+            bool lit = UiState.HasLitKey();
             if (flashId != null && Environment.TickCount - flashTick > 1100) { flashId = null; Invalidate(); }
             else if (flashId != null) Invalidate();
+            else if (lit) Invalidate();                         // pressed-key light: keep repainting while lit
+            else if (hadLit) Invalidate();                      // light just went off: paint the art dark once
+            hadLit = lit;
         };
         flashTimer.Start();
     }
@@ -238,13 +243,14 @@ class MapCanvas : Control {
 
         // remote first: connectors draw on top so their endpoints stay visible
         // where they reach the buttons
-        RemotePainter.Draw(g, ArtRect(), UiState.Take().Talking, flashId);
+        var s = UiState.Take();
+        RemotePainter.Draw(g, ArtRect(), s.Talking, flashId, s.KeysLit);
 
         foreach (MapCard card in cards) {
             bool leftSide = Array.IndexOf(LeftOrder, card.Entry.id) >= 0;
             PointF p1 = Hotspot(card.Entry.id);
             var p2f = new PointF(leftSide ? card.Right : card.Left, card.Top + card.Height / 2f);
-            bool hot = flashId == card.Entry.id || card.Hovered;
+            bool hot = flashId == card.Entry.id || card.Hovered || s.IsLit(card.Entry.id);
             DrawConnector(g, p1, p2f, hot, card.Entry.needsDriver);
             if (card.Entry.needsDriver) {
                 Gfx.Text(g, "需驱动", MacTheme.Font(8f), MacTheme.TextTertiary,
@@ -257,7 +263,7 @@ class MapCanvas : Control {
         foreach (DriverKeyCard card in driverCards) {
             PointF p1 = Hotspot(card.Entry.id);
             var p2f = new PointF(card.Left + card.Width / 2f, card.Top);
-            bool hot = flashId == card.Entry.id || card.Hovered;
+            bool hot = flashId == card.Entry.id || card.Hovered || s.IsLit(card.Entry.id);
             Color line = hot ? MacTheme.Accent : Color.FromArgb(203, 207, 215);
             float dy = p2f.Y - p1.Y;
             var c1 = new PointF(p1.X, p1.Y + dy * 0.35f);

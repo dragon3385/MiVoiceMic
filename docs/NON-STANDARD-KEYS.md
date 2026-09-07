@@ -36,7 +36,7 @@ RemoteMapper 作者用 Android `getevent` 做对照确认：遥控器确实发�
 
 | 路线 | 可行性 | 原因 |
 |---|---|---|
-| **KMDF 内核过滤驱动**（本项目内置） | ✓（需测试签名） | 在报告到达 `kbdhid.sys` 前拦截，把 7 键改写成 F13–F19；精确绑定 `VID 2717 / PID 32B8` 的 HID TLC，ATVV 语音报告不受影响 |
+| **KMDF 内核过滤驱动**（本项目内置） | ✓（需测试签名） | 在报告到达 `kbdhid.sys` 前拦截，把 7 个非标准键改写成 F13–F19，并把语音键 F5 改写为 F20（与物理 F5 彻底隔离，本程序视同 F5）；精确绑定 `VID 2717 / PID 32B8` 的 HID TLC，ATVV 语音报告不受影响 |
 | 注册表 Scancode Map / PowerToys / AutoHotkey | ✗ | 只能重映射"已存在"的按键；这些键没有事件 |
 | Raw Input / `WM_APPCOMMAND` | ✗ | 上游已丢弃 |
 | WinRT `Windows.Devices.Hid` / Chrome WebHID 直接读 HID | ✗ | Keyboard Page 属于受保护用法；且键盘 TLC 被系统独占打开 |
@@ -57,7 +57,7 @@ RemoteMapper 项目的官方安装脚本（自动弹 UAC 提权）：
    并把驱动测试证书装入受信任存储 → **重启**
 2. **第 2 步 `install-driver.bat`**：`pnputil /add-driver` 安装扩展 INF，把过滤驱动挂到
    遥控器的 HID TLC 上 → **再重启**
-3. 重启后这些键以 **F13–F19** 到达系统——按键映射页里已保存的配置自动生效
+3. 重启后这些键以 **F13–F19** 到达系统——按键映射页里已保存的配置自动生效；语音键同时被驱动改写为 **F20**（与物理 F5 隔离），本程序自动把它视同 F5 处理，F5 拦截与按键映射行为不变
 
 ### 代价与限制（务必阅读）
 

@@ -41,7 +41,7 @@ static class TrayIcon {
 
         var miPreset = new ToolStripMenuItem("语音热键");
         var presets = new[] {
-            new { Text = "微信输入法 (右Alt+逗号 按住)", Key = "wetype" },
+            new { Text = "微信输入法 (Ctrl+Win 按住)", Key = "wetype" },
             new { Text = "Windows 语音键入 (Win+H 点按)", Key = "winh" },
             new { Text = "不注入热键 (仅推流音频)", Key = "none" },
         };
