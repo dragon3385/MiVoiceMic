@@ -130,6 +130,18 @@ static class SelfTest {
         Check(empty.Length == 2 && empty[0] == 0xA2, "keyname empty list falls back to Ctrl+Win");
         var f12 = KeyMapNames.ParseList(new List<string> { "F12" });
         Check(f12.Length == 1 && f12[0] == 0x7B, "keyname ParseList preserves F12（注入不再丢键）");
+        // NormalizeForInject: WeType 2.1.3.18's Ctrl+Win voice hotkey only completes
+        // when Ctrl is the LAST key pressed - config order [LCTRL,LWIN] must inject
+        // as [LWIN,LCTRL] (real-device test 2026-09-08: Ctrl-first never opened the
+        // voice panel).
+        var norm = KeyMapNames.NormalizeForInject(new ushort[] { 0xA2, 0x5B });
+        Check(norm.Length == 2 && norm[0] == 0x5B && norm[1] == 0xA2, "inject normalize Win before Ctrl（WeType 顺序敏感）");
+        var normKeep = KeyMapNames.NormalizeForInject(new ushort[] { 0x5B, 0x48 });
+        Check(normKeep.Length == 2 && normKeep[0] == 0x5B && normKeep[1] == 0x48, "inject normalize keeps LWIN+H");
+        var normAlt = KeyMapNames.NormalizeForInject(new ushort[] { 0xA5, 0xBC });
+        Check(normAlt.Length == 2 && normAlt[0] == 0xA5 && normAlt[1] == 0xBC, "inject normalize keeps RALT+comma (modifier first)");
+        var normStable = KeyMapNames.NormalizeForInject(new ushort[] { 0x41, 0x42 });
+        Check(normStable.Length == 2 && normStable[0] == 0x41 && normStable[1] == 0x42, "inject normalize stable for non-modifiers");
     }
 
     static void TestConfigRoundtrip() {

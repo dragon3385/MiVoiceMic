@@ -12,6 +12,11 @@
 //     receiving NO events (mapped keys passed as raw arrows for seconds). The
 //     hook is now simply NEVER removed: HookCb ignores injected keys via
 //     LLKHF_INJECTED, so our own SendInput can never loop through it.
+//  3. Combo ORDER matters for WeType 2.1.3.18: its Ctrl+Win voice hotkey only
+//     completes when Ctrl is the LAST key pressed (Win held first). Config
+//     order [LCTRL,LWIN] produced a perfect-looking but dead injection - the
+//     voice panel never opened (real-device test 2026-09-08). Combo is now
+//     normalized Win-first via KeyMapNames.NormalizeForInject.
 // 中文：SendInput 组合键注入 —— 输入法语音热键的按住/点按控制
 using System;
 using System.Collections.Generic;
@@ -40,7 +45,7 @@ sealed class HotkeyInjector {
     readonly bool tapMode;        // true: tap combo on press and again on release
 
     public HotkeyInjector(IList<string> keyNames, string mode) {
-        combo = KeyMapNames.ParseList(keyNames);
+        combo = KeyMapNames.NormalizeForInject(KeyMapNames.ParseList(keyNames));
         tapMode = mode != null && mode.Equals("tap", StringComparison.OrdinalIgnoreCase);
     }
 

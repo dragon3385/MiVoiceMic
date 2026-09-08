@@ -232,7 +232,7 @@ class ConnectPage : MacPage {
 
     void TestHotkey() {
         try {
-            ushort[] vks = KeyMapNames.ParseList(App.Config.hotkey.keys);
+            ushort[] vks = KeyMapNames.NormalizeForInject(KeyMapNames.ParseList(App.Config.hotkey.keys));
             if (vks.Length == 0) return;
             KeySender.Tap(vks);
             Log.Info("[UI] 测试热键: " + KeyMapNames.FriendlyCombo(vks));

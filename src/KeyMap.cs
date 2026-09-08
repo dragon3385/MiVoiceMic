@@ -255,6 +255,28 @@ static class KeyMapNames {
         return list.ToArray();
     }
 
+    /// Reorder a parsed combo for injection: Win-class modifiers first, then
+    /// other modifiers, trigger keys last (so the caller's reverse-order release
+    /// puts the trigger key up first and Win up last). Real-device finding
+    /// (2026-09-08, WeType 2.1.3.18): the Ctrl+Win voice hotkey only completes
+    /// when Ctrl is the LAST key pressed - injecting the config order
+    /// [LCTRL,LWIN] never opens the voice panel, [LWIN,LCTRL] triggers it
+    /// instantly. Stable: relative order inside each group is preserved.
+    public static ushort[] NormalizeForInject(ushort[] keys) {
+        if (keys == null || keys.Length < 2) return keys;
+        var win = new List<ushort>();
+        var mod = new List<ushort>();
+        var rest = new List<ushort>();
+        foreach (ushort k in keys) {
+            if (k == 0x5B || k == 0x5C) win.Add(k);
+            else if ((k >= 0xA0 && k <= 0xA5)) mod.Add(k);
+            else rest.Add(k);
+        }
+        var ordered = new List<ushort>(keys.Length);
+        ordered.AddRange(win); ordered.AddRange(mod); ordered.AddRange(rest);
+        return ordered.ToArray();
+    }
+
     public static string FormatCombo(ushort[] combo) {
         if (combo == null || combo.Length == 0) return "";
         var parts = new List<string>();

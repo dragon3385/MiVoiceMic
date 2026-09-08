@@ -484,6 +484,7 @@ static class InputRouter {
                 case MapActionKind.Combo: {
                     ushort[] combo;
                     if (!KeyMapNames.TryParseCombo(act.keys, out combo)) return;
+                    combo = KeyMapNames.NormalizeForInject(combo);   // Win-class modifiers first (WeType order quirk)
                     if (act.tap) KeySender.Tap(combo);
                     else if (a.Phase == GestureEngine.Phase.Down) KeySender.Press(combo);
                     else KeySender.Release(combo);
