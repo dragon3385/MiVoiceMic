@@ -44,6 +44,7 @@ static class InputRouter {
 
     const int WH_KEYBOARD_LL = 13;
     const uint WM_APP_REHOOK = 0x8000;
+    const uint WM_APP_SHIELD = 0x8001;
     const uint LLKHF_INJECTED = 0x10;
     const ushort VK_F5 = 0x74;
     const ushort VK_F20 = 0x83;           // the bundled filter driver's voice-key spelling
@@ -62,6 +63,59 @@ static class InputRouter {
     static uint pumpTid;
     static volatile bool blockF5;         // swallow remote/physical F5 while linked
     static volatile bool linked;          // BLE link connected
+
+    // ---- F5 shield hook -----------------------------------------------------
+    // The IME's own keyboard hook can sit AHEAD of ours in the LL chain (hook
+    // order = install order, and the IME (re)installs dynamically). While the
+    // voice button is held, its physical F5 auto-repeat fires every ~33 ms and
+    // reaches the IME before our swallow runs, so "Ctrl is the LAST key pressed"
+    // (the IME's voice-trigger completion rule) never holds and the voice panel
+    // never opens - the remote path then falls into the chat client's own voice
+    // toolbar (whole-sentence insert, no end punctuation). The shield is a
+    // second LL hook installed fresh at VoiceDown (fresh = newest = first in
+    // chain) that swallows ONLY F5, and is removed at VoiceUp. The resident
+    // main hook is never touched (no unhook/rehook gap).
+    static readonly HookProc shieldProc = ShieldCb;
+    static volatile IntPtr shieldHhk = IntPtr.Zero;
+
+    /// Arm (true) / disarm (false) the F5 shield hook. Safe to call from any
+    /// thread; the install/uninstall runs on the pump thread (LL hooks need a
+    /// message pump on their installing thread).
+    public static void SetF5Shield(bool on) {
+        if (pump == null || pumpTid == 0) return;
+        PostThreadMessage(pumpTid, WM_APP_SHIELD, on ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero);
+    }
+
+    /// Force re-install of the shield hook (unhook + immediate re-install on
+    /// the pump thread). A LL hook's chain position is its INSTALL time, and
+    /// the IME re-installs its own hook dynamically - a shield armed earlier
+    /// can silently end up BEHIND the IME's hook again. Called from VoiceDown
+    /// right before the combo injection: a fresh install is guaranteed to be
+    /// the newest hook (first in chain) at the exact moment that matters.
+    public static void ReArmF5Shield() {
+        if (pump == null || pumpTid == 0) return;
+        PostThreadMessage(pumpTid, WM_APP_SHIELD, (IntPtr)2, IntPtr.Zero);
+    }
+
+    static IntPtr ShieldCb(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0) {
+            var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+            // Swallow only REAL F5 key-downs. The release must always pass:
+            // if the IME's hook sits ahead of this one it will have seen the
+            // F5-down, and swallowing the up too leaves the F5 "held forever"
+            // in its view - the IME's voice trigger requires no other
+            // non-modifier key held (real-device matrix 2026-09-09: held F5 =
+            // no panel, released F5 = panel). Injected keys pass as well so
+            // the F5-up cleanup in HotkeyInjector.OnVoiceDown can clear a
+            // stuck state even through this hook. A stray lone keyup is
+            // ignored by applications.
+            bool down = wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104;
+            bool injected = (k.flags & LLKHF_INJECTED) != 0;
+            if (down && !injected && NormalizeVoiceKey(k.vkCode) == VK_F5) return (IntPtr)1;
+        }
+        return CallNextHookEx(shieldHhk, nCode, wParam, lParam);
+    }
+
     public static long SwallowedCount;
     static int lastPassLogTick;           // hook thread only: throttle passthrough notes
     static int lastTraceLogTick;          // hook thread only: throttle the live-state trace
@@ -371,6 +425,23 @@ static class InputRouter {
                     hhk = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
                     Log.Info("[INPUT] hook reinstalled 0x" + hhk.ToString("X") +
                              (hhk == IntPtr.Zero ? " FAILED err=" + Marshal.GetLastWin32Error() : ""));
+                } else if (m.message == WM_APP_SHIELD) {
+                    if (m.wParam != IntPtr.Zero) {
+                        bool force = m.wParam == (IntPtr)2;
+                        if (force && shieldHhk != IntPtr.Zero) {   // re-install: jump back to the top of the hook chain
+                            UnhookWindowsHookEx(shieldHhk);
+                            shieldHhk = IntPtr.Zero;
+                        }
+                        if (shieldHhk == IntPtr.Zero) {
+                            shieldHhk = SetWindowsHookEx(WH_KEYBOARD_LL, shieldProc, GetModuleHandle(null), 0);
+                            Log.Info("[INPUT] F5 shield armed 0x" + shieldHhk.ToString("X") +
+                                     (shieldHhk == IntPtr.Zero ? " FAILED err=" + Marshal.GetLastWin32Error() : ""));
+                        }
+                    } else if (shieldHhk != IntPtr.Zero) {
+                        UnhookWindowsHookEx(shieldHhk);
+                        shieldHhk = IntPtr.Zero;
+                        Log.Info("[INPUT] F5 shield disarmed");
+                    }
                 }
                 TranslateMessage(ref m);
                 DispatchMessage(ref m);
@@ -416,6 +487,8 @@ static class InputRouter {
     }
 
     public static void Stop() {
+        SetF5Shield(false);
+        if (shieldHhk != IntPtr.Zero) { UnhookWindowsHookEx(shieldHhk); shieldHhk = IntPtr.Zero; }
         if (hhk != IntPtr.Zero) { UnhookWindowsHookEx(hhk); hhk = IntPtr.Zero; }
         RawSink.Stop();
     }
@@ -425,12 +498,24 @@ static class InputRouter {
         lock (pendingGate) probeVerdict[(ushort)vk] = verdict;
     }
 
-    public static void SetBlockF5(bool on) { blockF5 = on; }
+    public static void SetBlockF5(bool on) {
+        blockF5 = on;
+        UpdateShield();
+    }
     public static void SetLinked(bool on) {
         linked = on;
         if (!on) ReleaseEngineHolds();                      // remote gone mid-press: release its combos
+        UpdateShield();
     }
     public static void SetMappingEnabled(bool on) { mappingEnabled = on; }
+
+    /// The shield must be up the whole time the remote is linked - the very
+    /// first F5 keydown of a voice press (which races AUDIO_START, before any
+    /// VoiceDown-time arming) is enough to poison the IME's voice trigger.
+    /// While linked, blockF5 semantics say F5 is swallowed anyway; the shield
+    /// is the only placement where that swallow is actually effective against
+    /// the IME's own hook.
+    static void UpdateShield() { SetF5Shield(linked && blockF5); }
 
     /// Swap in a new mapping table (config edit / preset load). Safe at any time.
     public static void SetKeyMap(KeyMapConfig map) { SetKeyMap(map, null); }

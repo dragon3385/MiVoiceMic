@@ -95,6 +95,12 @@ sealed class HotkeyInjector {
     /// Voice key pressed: default-mic already switched by caller.
     public void OnVoiceDown() {
         foreach (ushort vk in combo) ForcedRelease(vk);   // clean slate
+        ForcedRelease(0x74);   // F5-up: the remote's voice key sends F5 to Windows and the
+                               // shield cannot guarantee the IME never saw its down (the IME
+                               // re-installs its hook ahead of ours). Without a matching up
+                               // the IME sees F5 held forever and its voice trigger - which
+                               // requires no other non-modifier key held - never completes.
+                               // Harmless when the IME never saw the down (lone keyup).
         System.Threading.Thread.Sleep(50);
         if (tapMode) {
             if (!TapOnce(combo)) Log.Warn("[KEY] tap down failed");

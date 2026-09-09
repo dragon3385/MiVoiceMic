@@ -128,7 +128,15 @@ sealed class App : BleVoiceLink.IHandler {
                         switcher.SwitchToTarget();
                         if (cfg.switchLeadMs > 0) Thread.Sleep(cfg.switchLeadMs);
                     }
-                    if (cfg.hotkeyEnabled) injector.OnVoiceDown();
+                    // The held voice key floods F5 repeats (~33 ms) that reach
+                    // the IME's own hook ahead of our swallow and break its
+                    // "trigger key is the LAST key pressed" rule. Re-install
+                    // the F5 shield right before the combo so it is the newest
+                    // hook (first in chain) at that moment.
+                    if (cfg.hotkeyEnabled) {
+                        InputRouter.ReArmF5Shield();
+                        injector.OnVoiceDown();
+                    }
                 } else {
                     if (cfg.hotkeyEnabled) injector.OnVoiceUp();
                     switcher.Restore();
