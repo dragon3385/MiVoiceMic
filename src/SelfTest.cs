@@ -1,5 +1,5 @@
 // SelfTest.cs - offline logic tests (run with: MiVoiceMic.exe --selftest)
-// 中文：离线单元测试 —— 解码/配置/键名/手势引擎/引擎复位/钩子判定/F20 归一/充电状态解析/按键归因/按键点亮（91 项）
+// 中文：离线单元测试 —— 解码/配置/键名/手势引擎/引擎复位/钩子判定/F20 归一/充电状态解析/按键归因/按键点亮/推流自愈（104 项）
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -30,8 +30,38 @@ static class SelfTest {
         TestDeferredAttribution();
         TestVoiceKeyF20();
         TestKeyLitState();
+        TestRenderHealth();
         Console.WriteLine("== " + passed + " passed, " + failed + " failed ==");
         return failed == 0 ? 0 : 1;
+    }
+
+    // AudioOut's stall detector: a write that never completes within STALL_MS
+    // must be reported as a dead device (2026-09-22 real-device failure: a
+    // ~20 h old run silently stopped rendering - frames decoded, nothing out).
+    static void TestRenderHealth() {
+        var h = new RenderHealth();
+        Check(!h.Stalled(0, 800), "render health: idle pipeline not stalled");
+        h.OnWrite(1000);
+        Check(!h.Stalled(1799, 800), "render health: within stall window not stalled");
+        Check(h.Stalled(1801, 800), "render health: write never completed -> stalled");
+        h.OnProgress();
+        Check(!h.Stalled(99999, 800), "render health: completion clears stall");
+        h.OnWrite(1000);
+        h.OnWrite(5000);
+        Check(h.Stalled(5200, 800), "render health: later write does not restart expectation window");
+        h.OnProgress();
+        h.OnWrite(5000);
+        Check(h.Stalled(5801, 800), "render health: stalls again after clear");
+        h.OnProgress();
+        h.OnWriteFailed();
+        Check(h.Stalled(int.MaxValue - 1, 800), "render health: failed write -> immediate stall");
+        h.OnProgress();
+        // wrap-around: expectation set just before int.MaxValue rolls over
+        var w = new RenderHealth();
+        w.OnWrite(int.MaxValue - 10);
+        Check(w.Stalled(int.MinValue + 800, 800), "render health: stall detection survives tick wrap");
+        w.OnProgress();
+        Check(!w.Stalled(int.MinValue + 800, 800), "render health: wrap + progress not stalled");
     }
 
     static short[] MakeSine(int n, double freqHz, int amp) {

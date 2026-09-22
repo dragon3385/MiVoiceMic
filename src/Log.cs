@@ -14,7 +14,12 @@ static class Log {
     public static void Init(string path) {
         try {
             file = new StreamWriter(path, false, new UTF8Encoding(false)) { AutoFlush = true };
-        } catch { file = null; }
+        } catch {
+            // a previous instance still holds the log (restart race, 2026-09-22):
+            // truncate-open throws and a naive catch left the new instance running
+            // with NO file log at all - fall back to append instead of going blind
+            try { file = new StreamWriter(path, true, new UTF8Encoding(false)) { AutoFlush = true }; } catch { file = null; }
+        }
     }
 
     public static void Close() {
