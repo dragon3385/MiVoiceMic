@@ -13,6 +13,10 @@
 // harmless orphan keyup, its own WM_INPUT names the device, and the worker
 // either fires the mapped action (remote) or replays the original key
 // (physical). No ghost keys, no misattributed physical presses.
+// Since 2026-09-30 the voice key's F5 rides the same machinery (see the F5
+// shield hook): the PHYSICAL keyboard's F5 passes through (zero-latency while
+// typing, Tap-restored via deferred attribution otherwise) and only the
+// remote's F5 is swallowed to protect the IME's voice trigger.
 //
 // Gestures: click / long-press per key, actions = combo (tap or hold-through),
 // task view, launch app, shell command. Executed on a dedicated worker thread,
@@ -61,20 +65,42 @@ static class InputRouter {
     static volatile IntPtr hhk = IntPtr.Zero;
     static Thread pump;
     static uint pumpTid;
-    static volatile bool blockF5;         // swallow remote/physical F5 while linked
+    static volatile bool blockF5;         // swallow the remote's F5 while linked (physical F5 is attributed)
     static volatile bool linked;          // BLE link connected
+    static volatile bool voiceHold;       // BLE voice session in flight (voice key held): F5 is definitely the remote
+    /// How recently a real non-remote keyboard key must have passed for the
+    /// shield to pass an F5 down at ZERO latency (user actively typing /
+    /// Ctrl+F5-style chords: the modifier refreshes the clock first). Longer
+    /// windows buy convenience but widen the false-pass window for a voice
+    /// press that follows typing (still self-correcting: OnVoiceDown injects
+    /// an F5-up before the hotkey combo).
+    internal const long F5_PASS_WINDOW_MS = 400;
 
     // ---- F5 shield hook -----------------------------------------------------
-    // The IME's own keyboard hook can sit AHEAD of ours in the LL chain (hook
-    // order = install order, and the IME (re)installs dynamically). While the
-    // voice button is held, its physical F5 auto-repeat fires every ~33 ms and
-    // reaches the IME before our swallow runs, so "Ctrl is the LAST key pressed"
-    // (the IME's voice-trigger completion rule) never holds and the voice panel
-    // never opens - the remote path then falls into the chat client's own voice
-    // toolbar (whole-sentence insert, no end punctuation). The shield is a
-    // second LL hook installed fresh at VoiceDown (fresh = newest = first in
-    // chain) that swallows ONLY F5, and is removed at VoiceUp. The resident
-    // main hook is never touched (no unhook/rehook gap).
+    // The IME's own keyboard hook can sit AHEAD of our main hook in the LL
+    // chain (hook order = install order, and the IME (re)installs dynamically),
+    // so the main hook's swallow cannot protect the IME's voice trigger from
+    // the remote's F5. The shield is a second LL hook, armed the whole time
+    // the remote is linked, that owns every real F5 decision - it sits at the
+    // front of the chain right after (re)arming (see ReArmF5Shield).
+    //
+    // 2026-09-30: the shield is device-AWARE. It used to swallow every real
+    // F5 down, which also killed the physical keyboard's F5 for the whole
+    // link session (the user's browser refresh). Now (unbound voice key):
+    //   voice session in flight        -> swallow (definitely the remote)
+    //   physical keyboard spoke <400ms -> PASS at zero latency (actively
+    //                                      typing; a wrong pass is corrected
+    //                                      by OnVoiceDown's injected F5-up)
+    //   no evidence                    -> swallow into DEFERRED attribution:
+    //                                      first auto-repeat is passed as a
+    //                                      rewritten VK_F24 probe (its
+    //                                      WM_INPUT names the device), the
+    //                                      UP always passes and its own
+    //                                      WM_INPUT settles a click; the
+    //                                      worker then swallows the rest of a
+    //                                      remote flood or Tap-restores the
+    //                                      physical key (see ResolvePendingEvents).
+    // The main hook only mirrors these decisions (see HookCb's f5Case branch).
     static readonly HookProc shieldProc = ShieldCb;
     static volatile IntPtr shieldHhk = IntPtr.Zero;
 
@@ -97,21 +123,84 @@ static class InputRouter {
         PostThreadMessage(pumpTid, WM_APP_SHIELD, (IntPtr)2, IntPtr.Zero);
     }
 
+    // F5 pass holdover deadline. The HOOK thread sets it when passing an F5
+    // down (covers the OS typematic delay, which outlives the typing-evidence
+    // window; every passing repeat refreshes RecentPhysicalKey on its own).
+    // Unlink zeroes it (aligned 64-bit store, benign) so a fresh link starts
+    // clean. Expires on its own otherwise.
+    static long f5PassHoldUntil;
+
+    /// Shared F5 pass predicate: the shield DECIDES with it, the main hook
+    /// MIRRORS it (both run on the same thread inside one chain pass, and its
+    /// inputs - lastForeignTick / f5PassHoldUntil - cannot change mid-chain,
+    /// so the two hooks can never disagree about the same event).
+    static bool F5PhysicalPass() {
+        return RawSink.RecentPhysicalKey(F5_PASS_WINDOW_MS) || NowMs() < f5PassHoldUntil;
+    }
+
     static IntPtr ShieldCb(int nCode, IntPtr wParam, IntPtr lParam) {
         if (nCode >= 0) {
             var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
-            // Swallow only REAL F5 key-downs. The release must always pass:
-            // if the IME's hook sits ahead of this one it will have seen the
-            // F5-down, and swallowing the up too leaves the F5 "held forever"
-            // in its view - the IME's voice trigger requires no other
-            // non-modifier key held (real-device matrix 2026-09-09: held F5 =
-            // no panel, released F5 = panel). Injected keys pass as well so
-            // the F5-up cleanup in HotkeyInjector.OnVoiceDown can clear a
-            // stuck state even through this hook. A stray lone keyup is
-            // ignored by applications.
             bool down = wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104;
             bool injected = (k.flags & LLKHF_INJECTED) != 0;
-            if (down && !injected && NormalizeVoiceKey(k.vkCode) == VK_F5) return (IntPtr)1;
+            uint vk = NormalizeVoiceKey(k.vkCode);      // driver voice key (F20) == F5
+            if (!injected && vk == VK_F5 && linked && blockF5) {
+                if (!down) {
+                    // The release ALWAYS passes: apps ignore a lone orphan
+                    // keyup, the IME's view of F5 can never stick, and the
+                    // up's own WM_INPUT is the per-event device truth the
+                    // deferred-attribution worker settles the press with.
+                    PendingPress pp;
+                    pending.TryGetValue(VK_F5, out pp);
+                    if (pp != null) {
+                        pending.Remove(VK_F5);
+                        lock (pendingGate) pendingEvents.Add(new PendingEvent {
+                            Vk = VK_F5, RealVk = VK_F5, HookTick = NowMs(), DownTick = pp.DownTick,
+                            Probe = false, Probing = pp.Probing
+                        });
+                    }
+                    return CallNextHookEx(shieldHhk, nCode, wParam, lParam);
+                }
+                bool f5Bound;
+                lock (mapGate) f5Bound = mappingEnabled && engine.HasBinding(VK_F5);
+                if (voiceHold || f5Bound) {
+                    // A voice session is in flight (or the voice key carries a
+                    // keymap binding and the legacy path owns it): this F5 is
+                    // definitely the remote's - plain swallow, no bookkeeping.
+                    return (IntPtr)1;
+                }
+                PendingPress pp2;
+                pending.TryGetValue(VK_F5, out pp2);
+                if (pp2 == null) {
+                    if (F5PhysicalPass()) {             // user actively typing: zero-latency pass
+                        f5PassHoldUntil = NowMs() + 800;
+                        return CallNextHookEx(shieldHhk, nCode, wParam, lParam);
+                    }
+                    pending[VK_F5] = new PendingPress { DownTick = NowMs() };   // deferred: swallow, settle from probe/up
+                    return (IntPtr)1;
+                }
+                if (!pp2.Probing) {
+                    pp2.Probing = true;                 // first auto-repeat becomes the device probe
+                    KBDLLHOOKSTRUCT probe = k;          // (rewritten, so nothing can ghost a real key)
+                    probe.vkCode = PROBE_VK;
+                    probe.scanCode = KeySender.ScanOf(PROBE_VK);
+                    probe.flags &= ~LLKHF_EXTENDED;
+                    Marshal.StructureToPtr(probe, lParam, false);
+                    lock (pendingGate) pendingEvents.Add(new PendingEvent {
+                        Vk = PROBE_VK, RealVk = VK_F5, HookTick = NowMs(), DownTick = pp2.DownTick, Probe = true
+                    });
+                    return CallNextHookEx(shieldHhk, nCode, wParam, lParam);   // the F24 probe passes (harmless)
+                }
+                int v; bool known;
+                lock (pendingGate) known = probeVerdict.TryGetValue(VK_F5, out v);
+                if (!known) return (IntPtr)1;           // verdict not in yet: swallow
+                if (v == 1) {
+                    RawSink.NoteRemoteActivity();       // swallowed flood: latch the remote clock
+                    NoteRemoteKey(VK_F5, true);         // held remote voice key: keep the art lit
+                    return (IntPtr)1;
+                }
+                f5PassHoldUntil = NowMs() + 800;        // physical: repeats flow as real keys
+            }
         }
         return CallNextHookEx(shieldHhk, nCode, wParam, lParam);
     }
@@ -209,9 +298,23 @@ static class InputRouter {
                 if ((k.flags & LLKHF_INJECTED) == 0) {          // never touch injected input
                     bool down = wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104;
                     uint vk = NormalizeVoiceKey(k.vkCode);      // driver voice key (F20) == F5
-                    bool f5Case = vk == VK_F5 && blockF5;        // legacy blocker semantics
+                    bool f5Case = vk == VK_F5 && blockF5;       // shield-owned, see the branch below
                     bool mapCase = false;
                     if (mappingEnabled) lock (mapGate) mapCase = engine.HasBinding(vk);
+                    if (f5Case && !mapCase) {
+                        // Unbound F5 is owned by the SHIELD (the only chain
+                        // position ahead of the IME); this hook merely mirrors
+                        // its decisions. The UP must pass unconditionally -
+                        // the raw-input ring needs its WM_INPUT as the
+                        // per-event device truth - and an event the shield
+                        // blessed must not be re-swallowed here (the IME
+                        // already saw the keydown). Anything else falling
+                        // through (shield disarm still in flight) keeps the
+                        // legacy protective swallow.
+                        if (!down || F5PhysicalPass()) return CallNextHookEx(hhk, nCode, wParam, lParam);
+                        Interlocked.Increment(ref SwallowedCount);
+                        return (IntPtr)1;
+                    }
                     if (mapCase && !f5Case && pending.Count > 0) {
                         PendingPress pp;
                         pending.TryGetValue(vk, out pp);
@@ -271,10 +374,10 @@ static class InputRouter {
                             }
                             return (IntPtr)1;
                         }
-                        if (f5Case) {                            // physical F5 while linked: still swallowed (old behavior)
-                            Interlocked.Increment(ref SwallowedCount);
-                            return (IntPtr)1;
-                        }
+                        if (f5Case) {                            // keymap-BOUND voice key: legacy semantics stay
+                            Interlocked.Increment(ref SwallowedCount);   // (shield swallows its downs; keep the up
+                            return (IntPtr)1;                            //  swallow too - the bound path uses the
+                        }                                                //  evidence clock, not deferred attribution)
                         if (mapCase && !down) {                  // evidence flipped mid-press: still let the engine finish its state
                             mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = false, TickMs = NowMs() });
                         }
@@ -408,6 +511,21 @@ static class InputRouter {
     }
     internal static IntPtr TestDispatch(uint vk, bool down) { return TestDispatch(vk, down, true); }
 
+    /// Unit-test hooks for the shield's F5 attribution path.
+    internal static IntPtr TestDispatchShield(uint vk, bool down) {
+        var k = new KBDLLHOOKSTRUCT { vkCode = vk };
+        IntPtr mem = Marshal.AllocHGlobal(Marshal.SizeOf(k));
+        try {
+            Marshal.StructureToPtr(k, mem, false);
+            return ShieldCb(0, (IntPtr)(down ? 0x0100 : 0x0101), mem);
+        } finally { Marshal.FreeHGlobal(mem); }
+    }
+    internal static int TestPendingF5() { return pending.ContainsKey(VK_F5) ? 1 : 0; }
+    internal static int TestPendingEventCount() { lock (pendingGate) return pendingEvents.Count; }
+    internal static void TestResolvePending() { ResolvePendingEvents(); }
+    internal static void TestSetVoiceHold(bool on) { voiceHold = on; }
+    internal static void TestClearF5Hold() { f5PassHoldUntil = 0; }
+
     public static void Start() {
         if (pump != null) return;
         pump = new Thread((ThreadStart)delegate {
@@ -504,17 +622,27 @@ static class InputRouter {
     }
     public static void SetLinked(bool on) {
         linked = on;
-        if (!on) ReleaseEngineHolds();                      // remote gone mid-press: release its combos
+        if (!on) {                                          // remote gone mid-press: release its combos,
+            voiceHold = false;                              // the voice session died with the link too,
+            f5PassHoldUntil = 0;                            // and a stale pass-holdover must not outlive it
+            ReleaseEngineHolds();
+        }
         UpdateShield();
     }
     public static void SetMappingEnabled(bool on) { mappingEnabled = on; }
 
+    /// BLE voice session in flight (voice key held): every real F5 is the
+    /// remote's for sure - the shield swallows flat, no deferred bookkeeping.
+    /// Called from App.OnVoiceStart/OnVoiceStop (the F5 down races AUDIO_START,
+    /// so presses before the flag exist and still settle via the deferred path).
+    public static void SetVoiceHold(bool on) { voiceHold = on; }
+
     /// The shield must be up the whole time the remote is linked - the very
     /// first F5 keydown of a voice press (which races AUDIO_START, before any
     /// VoiceDown-time arming) is enough to poison the IME's voice trigger.
-    /// While linked, blockF5 semantics say F5 is swallowed anyway; the shield
-    /// is the only placement where that swallow is actually effective against
-    /// the IME's own hook.
+    /// While linked, blockF5 semantics say the remote's F5 is swallowed; the
+    /// shield is the only placement where that swallow is effective against
+    /// the IME's own hook (the physical keyboard's F5 passes - see ShieldCb).
     static void UpdateShield() { SetF5Shield(linked && blockF5); }
 
     /// Swap in a new mapping table (config edit / preset load). Safe at any time.
@@ -784,13 +912,23 @@ static class KeySender {
         var inputs = new List<INPUT>();
         for (int i = 0; i < keys.Length; i++) inputs.Add(Make(keys[i], true));
         for (int i = keys.Length - 1; i >= 0; i--) inputs.Add(Make(keys[i], false));
-        SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT)));
+        Send(inputs.ToArray());
     }
 
     static void SendAll(ushort[] keys, bool down) {
         var inputs = new INPUT[keys.Length];
         int idx = 0;
         for (int i = 0; i < keys.Length; i++) inputs[idx++] = down ? Make(keys[i], true) : Make(keys[keys.Length - 1 - i], false);
+        Send(inputs);
+    }
+
+    // selftest hooks: with TestSuppress on, injections are COUNTED instead of
+    // sent (a selftest Tap(F5) would be a real keypress into whatever app
+    // currently has focus - e.g. refresh the user's browser).
+    internal static bool TestSuppress;
+    internal static int TestSent;
+    static void Send(INPUT[] inputs) {
+        if (TestSuppress) { TestSent += inputs.Length; return; }
         SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 }
@@ -1107,6 +1245,17 @@ static class RawSink {
         lock (ringGate) { lastRemoteTick = NowMs(); }
     }
 
+    /// True when a real non-remote keyboard key passed within the given window
+    /// - i.e. the user is actively typing. The F5 shield passes an F5 down at
+    /// zero latency on this evidence (a wrong pass self-corrects: OnVoiceDown
+    /// injects an F5-up before the hotkey combo, and every swallowed press
+    /// settles per-event via the deferred path). Injected keys (hDevice=0)
+    /// never touch this clock, so our own restores cannot re-bless themselves.
+    public static bool RecentPhysicalKey(long withinMs) {
+        long now = NowMs();
+        lock (ringGate) return lastForeignTick > 0 && now - lastForeignTick < withinMs;
+    }
+
     /// Test helper: seed the evidence clocks (ages in ms, -1 = never seen).
     internal static void SeedEvidence(long remoteAgeMs, long foreignAgeMs) {
         long now = NowMs();
@@ -1128,6 +1277,12 @@ static class RawSink {
             ring[ringHead].Remote = remote;
             ringHead = (ringHead + 1) % RING;
         }
+    }
+
+    /// Test helper: wipe the ring - FindRecent's window reaches ~30 ms back,
+    /// so a previous section's fresh seed would leak into the next one.
+    internal static void TestClearRing() {
+        lock (ringGate) { for (int i = 0; i < RING; i++) ring[i] = new Rec(); ringHead = 0; }
     }
 
     /// Newest ring event matching {vk, down} with Tick in [minTick, maxTick].

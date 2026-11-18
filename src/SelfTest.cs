@@ -1,5 +1,5 @@
 // SelfTest.cs - offline logic tests (run with: MiVoiceMic.exe --selftest)
-// 中文：离线单元测试 —— 解码/配置/键名/手势引擎/引擎复位/钩子判定/F20 归一/充电状态解析/按键归因/按键点亮/推流自愈（104 项）
+// 中文：离线单元测试 —— 解码/配置/键名/手势引擎/引擎复位/钩子判定/F20 归一/F5 盾设备归因/充电状态解析/按键归因/按键点亮/推流自愈（132 项）
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -28,6 +28,7 @@ static class SelfTest {
         TestChargeState();
         TestLooksFromRemote();
         TestDeferredAttribution();
+        TestF5ShieldAttribution();
         TestVoiceKeyF20();
         TestKeyLitState();
         TestRenderHealth();
@@ -452,6 +453,113 @@ static class SelfTest {
         InputRouter.SetKeyMap(null);
         RawSink.SeedEvidence(-1, -1);
         InputRouter.SetBlockF5(true);
+    }
+
+    static void TestF5ShieldAttribution() {
+        // 2026-09-30: the F5 shield is device-aware - the PHYSICAL keyboard's
+        // F5 passes (zero-latency while typing, Tap-restored via deferred
+        // attribution otherwise), only the remote's F5 is swallowed. KeySender
+        // injections are suppressed+counted: a live Tap would be a real F5
+        // into the focused app.
+        InputRouter.SetMappingEnabled(false);
+        InputRouter.SetBlockF5(true);
+        InputRouter.SetLinked(true);
+        InputRouter.TestSetVoiceHold(false);
+        InputRouter.TestClearF5Hold();
+        RawSink.SeedEvidence(-1, -1);
+        KeySender.TestSuppress = true;
+
+        // voice session in flight: the F5 is definitely the remote's
+        InputRouter.TestSetVoiceHold(true);
+        Check(InputRouter.TestDispatchShield(0x74, true) == (IntPtr)1, "F5盾：语音会话中 DOWN 吞下");
+        Check(InputRouter.TestDispatchShield(0x74, false) != (IntPtr)1, "F5盾：语音会话中 UP 放行");
+        InputRouter.TestSetVoiceHold(false);
+
+        // actively typing: zero-latency pass; the main hook mirrors the pass
+        RawSink.SeedEvidence(-1, 100);
+        Check(InputRouter.TestDispatchShield(0x74, true) != (IntPtr)1, "F5盾：打字中 DOWN 零延迟放行");
+        Check(InputRouter.TestDispatch(0x74, true) != (IntPtr)1, "F5主钩子：打字中 DOWN 放行（镜像盾）");
+        RawSink.SeedEvidence(-1, 3000);
+        Check(InputRouter.TestDispatchShield(0x74, true) != (IntPtr)1, "F5盾：放行后的按住重复键继续放行（holdover）");
+        InputRouter.TestClearF5Hold();
+
+        // remote click (the typical voice press): DOWN swallowed, UP's own
+        // WM_INPUT settles it as remote - NO restore injection
+        RawSink.SeedEvidence(-1, -1);
+        RawSink.TestClearRing();
+        KeySender.TestSent = 0;
+        Check(InputRouter.TestDispatchShield(0x74, true) == (IntPtr)1, "F5延迟归因：无证据 DOWN 吞下");
+        Check(InputRouter.TestPendingF5() == 1, "F5延迟归因：挂起已建立");
+        Check(InputRouter.TestDispatchShield(0x74, false) != (IntPtr)1, "F5延迟归因：UP 放行（孤儿抬起供 WM_INPUT 归因）");
+        Check(InputRouter.TestPendingF5() == 0, "F5延迟归因：UP 清除挂起");
+        RawSink.SeedRing(0x74, false, true, 0);
+        InputRouter.TestResolvePending();
+        Check(InputRouter.TestPendingEventCount() == 0 && KeySender.TestSent == 0, "F5延迟归因：遥控器松开 → 无还原注入");
+
+        // physical click: waits for the up's WM_INPUT, then Tap-restores the key
+        RawSink.SeedEvidence(-1, -1);
+        RawSink.TestClearRing();
+        Check(InputRouter.TestDispatchShield(0x74, true) == (IntPtr)1, "F5还原：无证据 DOWN 吞下");
+        Check(InputRouter.TestDispatchShield(0x74, false) != (IntPtr)1, "F5还原：UP 放行");
+        InputRouter.TestResolvePending();
+        Check(InputRouter.TestPendingEventCount() == 1, "F5还原：WM_INPUT 未到时等待（不盲目还原）");
+        RawSink.SeedRing(0x74, false, false, 0);
+        InputRouter.TestResolvePending();
+        Check(InputRouter.TestPendingEventCount() == 0 && KeySender.TestSent == 2, "F5还原：物理键盘松开 → 注入还原原键（↓+↑）");
+
+        // remote flood: first repeat probes, the verdict swallows the rest
+        RawSink.SeedEvidence(-1, -1);
+        RawSink.TestClearRing();
+        KeySender.TestSent = 0;
+        Check(InputRouter.TestDispatchShield(0x74, true) == (IntPtr)1, "F5连发：按下吞下");
+        Check(InputRouter.TestDispatchShield(0x74, true) != (IntPtr)1, "F5连发：首条自动重复放行（F24 探测）");
+        InputRouter.TestSetProbeVerdict(0x74, 1);
+        Check(InputRouter.TestDispatchShield(0x74, true) == (IntPtr)1, "F5连发：遥控器判定 → 后续重复键吞下");
+        RawSink.SeedRing(0x74, true, true, 0);          // the probe's own WM_INPUT (raw keeps the original vk)
+        InputRouter.TestResolvePending();
+        Check(InputRouter.TestDispatchShield(0x74, false) != (IntPtr)1, "F5连发：UP 放行");
+        RawSink.SeedRing(0x74, false, true, 0);
+        InputRouter.TestResolvePending();
+        Check(InputRouter.TestPendingEventCount() == 0, "F5连发：遥控器按住/松开全链结算完成");
+        Check(KeySender.TestSent == 1, "F5连发：探测退役注入 1 次 F24↑（实际 " + KeySender.TestSent + "）");
+
+        // physical hold: probe verdict keeps the repeat stream real
+        RawSink.SeedEvidence(-1, -1);
+        RawSink.TestClearRing();
+        Check(InputRouter.TestDispatchShield(0x74, true) == (IntPtr)1, "F5物理按住：按下吞下");
+        Check(InputRouter.TestDispatchShield(0x74, true) != (IntPtr)1, "F5物理按住：首条自动重复放行（探测）");
+        InputRouter.TestSetProbeVerdict(0x74, 0);
+        Check(InputRouter.TestDispatchShield(0x74, true) != (IntPtr)1, "F5物理按住：物理判定 → 重复键持续放行");
+        InputRouter.TestClearF5Hold();
+        Check(InputRouter.TestDispatchShield(0x74, false) != (IntPtr)1, "F5物理按住：UP 放行");
+        RawSink.SeedRing(0x74, true, false, 0);
+        InputRouter.TestResolvePending();
+        RawSink.SeedRing(0x74, false, false, 0);
+        InputRouter.TestResolvePending();
+        Check(InputRouter.TestPendingEventCount() == 0, "F5物理按住：结算排空");
+
+        // a keymap-BOUND voice key keeps the legacy flat-swallow semantics
+        var map = new KeyMapConfig();
+        map.enabled = true;
+        map.Find("voice").click.kind = "combo";
+        map.Find("voice").click.keys = "BACK";
+        InputRouter.SetKeyMap(map, null);
+        RawSink.SeedEvidence(-1, 100);                  // fresh typing would normally pass
+        Check(InputRouter.TestDispatchShield(0x74, true) == (IntPtr)1, "F5盾：语音键带映射 → 旧语义吞下");
+        Check(InputRouter.TestPendingF5() == 0, "F5盾：语音键带映射不进延迟归因");
+        InputRouter.SetKeyMap(null);
+
+        // unlinked: everything passes
+        InputRouter.SetLinked(false);
+        RawSink.SeedEvidence(-1, -1);
+        Check(InputRouter.TestDispatchShield(0x74, true) != (IntPtr)1, "F5盾：断链放行");
+        InputRouter.SetLinked(true);
+
+        // leave the suite's clean state
+        KeySender.TestSuppress = false; KeySender.TestSent = 0;
+        RawSink.SeedEvidence(-1, -1);
+        InputRouter.TestSetVoiceHold(false);
+        InputRouter.TestClearF5Hold();
     }
 
     static void TestKeyLitState() {

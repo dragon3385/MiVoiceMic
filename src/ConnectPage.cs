@@ -279,9 +279,9 @@ class ConnectPage : MacPage {
         micToggle.Location = new Point(rightX + rightW - MacTheme.S(58), ay + MacTheme.S(148) - MacTheme.S(2));
         dumpToggle.Location = new Point(rightX + rightW - MacTheme.S(58), ay + MacTheme.S(186) - MacTheme.S(2));
 
-        f5Toggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(34) - MacTheme.S(2));
-        autoPairToggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(66) - MacTheme.S(2));
-        autoStartToggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(98) - MacTheme.S(2));
+        f5Toggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(28) - MacTheme.S(2));
+        autoPairToggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(74) - MacTheme.S(2));
+        autoStartToggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(102) - MacTheme.S(2));
 
         reconnectBtn.Location = new Point(deviceCard.Left + (deviceCard.Width - reconnectBtn.Width) / 2,
             deviceCard.Bottom - MacTheme.S(52));
@@ -409,13 +409,15 @@ class ConnectPage : MacPage {
     void PaintRemoteContent(Graphics g) {
         int w = remoteCard.Width;
         Gfx.Text(g, "拦截语音键发出的 F5", bodyFont, MacTheme.TextPrimary,
-            new RectangleF(MacTheme.S(16), MacTheme.S(36), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
+            new RectangleF(MacTheme.S(16), MacTheme.S(30), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
+        Gfx.Text(g, "只拦遥控器的 F5，物理键盘 F5 自动放行", smallFont, MacTheme.TextTertiary,
+            new RectangleF(MacTheme.S(16), MacTheme.S(50), w - MacTheme.S(110), MacTheme.S(16)), StringAlignment.Near);
         Gfx.Text(g, "扫描到未配对遥控器时自动配对", bodyFont, MacTheme.TextPrimary,
-            new RectangleF(MacTheme.S(16), MacTheme.S(68), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
+            new RectangleF(MacTheme.S(16), MacTheme.S(76), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
         Gfx.Text(g, "开机自动启动 MiVoiceMic", bodyFont, MacTheme.TextPrimary,
-            new RectangleF(MacTheme.S(16), MacTheme.S(100), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
+            new RectangleF(MacTheme.S(16), MacTheme.S(104), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
         Gfx.Text(g, "以上设置立即生效并自动保存", smallFont, MacTheme.TextTertiary,
-            new RectangleF(MacTheme.S(16), MacTheme.S(124), w - MacTheme.S(110), MacTheme.S(16)), StringAlignment.Near);
+            new RectangleF(MacTheme.S(16), MacTheme.S(128), w - MacTheme.S(110), MacTheme.S(16)), StringAlignment.Near);
     }
 
     static string FormatSeconds(double secs) {

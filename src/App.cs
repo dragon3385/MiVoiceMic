@@ -218,6 +218,9 @@ sealed class App : BleVoiceLink.IHandler {
         // 0x03 = HTT (voice key physically held); other reasons are firmware-initiated
         // sessions (e.g. right after MIC_OPEN) and must NOT hold the IME hotkey.
         hotkeyHeld = interaction == 0x03;
+        // a held voice key means every real F5 is the remote's: the shield
+        // swallows flat during the session (no deferred bookkeeping churn)
+        InputRouter.SetVoiceHold(hotkeyHeld);
         // firmware-initiated sessions carry no user audio and no matching AUDIO_STOP,
         // so only a real key press may light up the talking UI (else it sticks on)
         UiState.SetTalking(hotkeyHeld);
@@ -249,6 +252,7 @@ sealed class App : BleVoiceLink.IHandler {
         if (hotkeyHeld)
             keyQueue.Add(new KeyAction { Kind = KeyActionKind.VoiceUp });
         hotkeyHeld = false;
+        InputRouter.SetVoiceHold(false);   // the shield returns to evidence-based F5 attribution
     }
 
     public void OnSync(int predictor, int stepIndex) {
