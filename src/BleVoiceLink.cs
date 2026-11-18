@@ -598,7 +598,17 @@ sealed class BleVoiceLink {
                     return method.Invoke(null, new object[] { op });
                 }
             }
-            throw new Exception("not an IAsyncOperation<T>: " + op.GetType());
+            // A raw COM RCW created by MethodInfo.Invoke (PairAsync via reflection)
+            // hides its WinRT interfaces from GetInterfaces() until something CASTS
+            // it - so the scan above always misses on System.__ComObject ("not an
+            // IAsyncOperation<T>" on every auto-pair attempt, 2026-11-18). Force
+            // the one PairAsync actually returns via the hard cast inside
+            // AwaitGeneric<T> (the cast does the QueryInterface and populates the
+            // RCW's interface map).
+            try { return AwaitGeneric<Windows.Devices.Enumeration.DevicePairingResult>(op); }
+            catch (InvalidCastException) {
+                throw new Exception("not an IAsyncOperation<T>: " + op.GetType());
+            }
         }
         static object AwaitGeneric<T>(object opObj) {
             var op = (IAsyncOperation<T>)opObj;
@@ -607,6 +617,9 @@ sealed class BleVoiceLink {
                 if (s == AsyncStatus.Completed) tcs.TrySetResult(o.GetResults());
                 else tcs.TrySetResult(null);
             };
+            // a pairing that pops consent UI (or dies silently) must not pin this
+            // ThreadPool thread forever - the caller retries on the next scan window
+            if (!tcs.Task.Wait(30000)) return null;
             return tcs.Task.Result;
         }
     }
