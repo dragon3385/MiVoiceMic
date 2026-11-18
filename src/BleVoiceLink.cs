@@ -174,7 +174,16 @@ sealed class BleVoiceLink {
                 Log.Warn("[BLE] link attempt failed: " + error);
                 handler.OnLinkState(false, "连接失败: " + error);
                 Cleanup();
-                await Delay(Math.Min(3 + failures * 2, 15), token);
+                // This backoff sleep is OUTSIDE the try above: a Reconnect()/Stop()
+                // cancel landing here throws TaskCanceledException straight out of
+                // this async void and KILLS the process (real crashes 2026-10-31 +
+                // 2026-11-18 x2, .NET event log: TaskCanceledException in
+                // <LinkLoop>d__6.MoveNext; user clicks 重新连接遥控器 while the loop
+                // is backing off after failed attempts - the exact wake-and-retry
+                // flow the README recommends). Swallow the cancel and yield: the
+                // newer loop owns the link now.
+                try { await Delay(Math.Min(3 + failures * 2, 15), token); }
+                catch (OperationCanceledException) { return; }
             }
         }
     }
